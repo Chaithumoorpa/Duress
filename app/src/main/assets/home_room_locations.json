@@ -1,0 +1,42 @@
+[
+  {
+    "id":"Right Corner Room - Front Right End",
+    "lat": 10.67624,
+    "lng": 76.00665
+  },
+  {
+    "id":"Right Corner Room - Front Left End",
+    "lat": 10.67610,
+    "lng": 76.00658
+  },
+  {
+    "id":"Right Corner Room - Back Left End",
+    "lat": 10.67605,
+    "lng": 76.00656
+  },
+  {
+    "id":"Right Corner Room - Back Right End",
+    "lat": 10.67575,
+    "lng": 76.00678
+  },
+  {
+    "id":"Left Corner Room - Back Left End",
+    "lat": 10.67482,
+    "lng": 76.00710
+  },
+  {
+    "id":"Left Corner Room - Back Right End",
+    "lat": 10.67578,
+    "lng": 76.00692
+  },
+  {
+    "id":"Left Corner Room - Front Left End",
+    "lat": 10.67554,
+    "lng": 76.00630
+  },
+  {
+    "id":"Left Corner Room - Front Right End",
+    "lat": 10.67603,
+    "lng": 76.00704
+  }
+]

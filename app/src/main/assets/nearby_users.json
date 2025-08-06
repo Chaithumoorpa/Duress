@@ -1,0 +1,17 @@
+[
+  {
+    "user": "Bob",
+    "beaconId": "AA:BB:CC:DD:EE:01",
+    "rssi": -70
+  },
+  {
+    "user": "Jim",
+    "beaconId": "AA:BB:CC:DD:EE:03",
+    "rssi": -75
+  },
+  {
+    "user": "Frank",
+    "beaconId": "AA:BB:CC:DD:EE:05",
+    "rssi": -80
+  }
+]
