@@ -101,8 +101,7 @@ class WebRTCClient(
                     override fun onRemoveStream(p0: MediaStream?) {}
                     override fun onDataChannel(p0: DataChannel?) {}
                     override fun onRenegotiationNeeded() {
-                        Log.d("WebRTCClient", "Renegotiation needed")
-                        createOffer()
+                        Log.d("WebRTCClient", "Renegotiation needed; ignoring to avoid loop")
                     }
 
                     override fun onConnectionChange(newState: PeerConnection.PeerConnectionState?) {
