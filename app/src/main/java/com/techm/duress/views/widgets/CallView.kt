@@ -5,21 +5,32 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 
 @Composable
-fun SpeakView(modifier: Modifier = Modifier,name:String?) {
-    println("debug/// SpeakView")
+fun SpeakView(
+    modifier: Modifier = Modifier,
+    name: String?,
+    enabled: Boolean = true,
+    onClick: (() -> Unit)? = null
+) {
     CustomButton(
+        modifier = modifier,
+        text = "Speak To ${name ?: "Requester"}",
         backgroundColor = Color(0xFF00BFFF),
-        text = "Speak To ${name?:"Requester"}",
-        modifier = modifier
+        enabled = enabled,
+        onClick = onClick
     )
 }
 
 @Composable
-fun CallView(modifier: Modifier = Modifier) {
-    println("debug/// CallView")
+fun CallView(
+    modifier: Modifier = Modifier,
+    enabled: Boolean = true,
+    onClick: (() -> Unit)? = null
+) {
     CustomButton(
-        backgroundColor = Color(0xFFB22222),
+        modifier = modifier,
         text = "Call 911",
-        modifier = modifier
+        backgroundColor = Color(0xFFB22222),
+        enabled = enabled,
+        onClick = onClick
     )
 }

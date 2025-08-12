@@ -26,6 +26,7 @@ fun CustomButton(
     backgroundColor: Color,
     onClick: (() -> Unit)? = null,
     height: Dp = 40.dp,
+    enabled: Boolean,
 ) {
     println("debug/// CustomButton")
     Box(

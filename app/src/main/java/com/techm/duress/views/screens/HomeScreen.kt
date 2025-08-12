@@ -2,43 +2,29 @@ package com.techm.duress.views.screens
 
 import android.content.Context
 import android.util.Log
-import androidx.camera.view.PreviewView
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.*
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.viewinterop.AndroidView
-import androidx.lifecycle.LifecycleOwner
-import androidx.compose.ui.platform.LocalLifecycleOwner
-import androidx.lifecycle.compose.LocalLifecycleOwner
-import androidx.lifecycle.viewmodel.compose.viewModel
 import com.techm.duress.core.ble.BleProvider
 import com.techm.duress.core.camera.CameraServiceProvider
 import com.techm.duress.core.fall.FallDetector
 import com.techm.duress.core.zone.ZoneDetector
-import com.techm.duress.core.webrtc.SignalingSocket
-import com.techm.duress.core.webrtc.WebRTCClient
 import com.techm.duress.viewmodel.MainViewModel
 import com.techm.duress.viewmodel.StreamingState
 import com.techm.duress.views.widgets.*
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.cancelChildren
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.isActive
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
-import kotlinx.coroutines.withTimeoutOrNull
-import org.webrtc.IceCandidate
-import org.webrtc.SessionDescription
+import kotlinx.coroutines.*
 import org.webrtc.VideoTrack
+
+private const val TAG = "DU/HOME"
 
 @Composable
 fun HomeScreen(
@@ -47,132 +33,147 @@ fun HomeScreen(
     userName: String,
 ) {
     val context = LocalContext.current
-    val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
 
+    // ---------- VM state (all are values, not flows) ----------
     val helpRequest by viewModel.helpRequest.collectAsState()
     val helperName by viewModel.helperName.collectAsState()
-    val status by viewModel.status.collectAsState()
+    val status by viewModel.sessionStatus.collectAsState()             // "open" | "taken" | "closed"
     val isHelpSessionActive by viewModel.isHelpSessionActive.collectAsState()
-    val videoTrack by viewModel.incomingVideoTrack.collectAsState()
+    val videoTrack by viewModel.incomingRemoteVideoTrack.collectAsState()
+    val isSignalingReady by viewModel.isSignalingReady.collectAsState()
+    val streamingState by viewModel.streamingState.collectAsState()
 
+    val roomId by viewModel.roomId.collectAsState()
+    val broadcasterWs by viewModel.broadcasterWs.collectAsState()
+    val viewerWs by viewModel.viewerWs.collectAsState()
+
+    // ---------- Local UI state ----------
     var dialogVisible by remember { mutableStateOf(false) }
     var giveHelpBtnPressed by remember { mutableStateOf(false) }
-    var isDuressDetected = remember { mutableStateOf(false) }
-    var isCameraOn = remember { mutableStateOf(false) }
+    val isDuressDetected = remember { mutableStateOf(false) }
+    val isCameraOn = remember { mutableStateOf(false) }
     var startPolling by remember { mutableStateOf(false) }
 
-    val previewView = remember { PreviewView(context) }
+    // Fall detector
     val fallDetector = remember { FallDetector(context) }
     val fallDetected by fallDetector.fallDetected.collectAsState()
-    val bleData = remember { mutableStateOf(emptyList<Pair<String, Int>>()) }
 
-    val signalingSocket = remember { mutableStateOf<SignalingSocket?>(null) }
-    val webRTCClient = remember { mutableStateOf<WebRTCClient?>(null) }
-    val socketRef = remember { mutableStateOf<SignalingSocket?>(null) }
+    // BLE demo data
+    val bleData = remember { mutableStateOf(emptyList<BleProvider.BleDevice>()) }
 
-
-    val requestingUser = viewModel.requestingUser
-
+    // Polling scope for listen_for_helper
     val pollingSupervisor = remember { SupervisorJob() }
     val pollingScope = remember { CoroutineScope(Dispatchers.IO + pollingSupervisor) }
 
-    var isSignalingReady by remember { mutableStateOf(false) }
-
-    val helpRequestedState = remember { mutableStateOf(false) }
-    val helpRequested by helpRequestedState
-
-    // BLE zone detection
+    // ---------- BLE zone “sim” ----------
     LaunchedEffect(Unit) {
-        withContext (Dispatchers.IO){ bleData.value = BleProvider.loadBLE(context)  }
-
+        Log.d(TAG, "BLE load start")
+        withContext(Dispatchers.IO) {
+            bleData.value = BleProvider.loadBLE(context)
+        }
+        Log.d(TAG, "BLE loaded: ${bleData.value.size} items")
     }
 
     LaunchedEffect(isDuressDetected.value) {
+        Log.d(TAG, "BLE drive loop started: duress=${isDuressDetected.value}")
         while (!isDuressDetected.value) {
             withContext(Dispatchers.Default) {
-                bleData.value.forEach { (beaconId, rssi) ->
-                    if (isDuressDetected.value) return@forEach
-                    ZoneDetector.onBeaconDetected(beaconId, rssi)
+                for (item in bleData.value) {
+                    if (isDuressDetected.value) break
+                    ZoneDetector.onBeaconDetected(item.beaconId, item.rssi)
                     delay(2000)
                 }
             }
         }
     }
 
+    // ---------- Fall sensor lifecycle ----------
     DisposableEffect(Unit) {
+        Log.d(TAG, "FallDetector.start()")
         fallDetector.start()
-        onDispose { fallDetector.stop() }
+        onDispose {
+            Log.d(TAG, "FallDetector.stop()")
+            fallDetector.stop()
+        }
     }
 
+    // Fall → auto send help (Victim path)
     LaunchedEffect(fallDetected) {
-        if (fallDetected && !helpRequested) {
-            Log.d("HomeScreen", "Fall detected. Sending help request.")
+        if (fallDetected && !isHelpSessionActive) {
+            Log.d(TAG, "Fall detected → sendHelpRequest (zone=${ZoneDetector.currentZone.value})")
             viewModel.setStreamingState(StreamingState.Signaling)
-            viewModel.sendHelpRequest(ZoneDetector.currentZone) {
-                helpRequestedState.value = true
+            viewModel.sendHelpRequest(ZoneDetector.currentZone.value) {
+                Log.d(TAG, "Help request created: roomId=${roomId}, bWS=${broadcasterWs}, vWS=${viewerWs}")
                 isCameraOn.value = true
+                startPolling = true
             }
         }
     }
 
-    LaunchedEffect(true) {
+    // Periodic discovery (Helper path) – see other users' duress
+    LaunchedEffect(Unit) {
         while (isActive) {
-            viewModel.checkForHelpRequest(userName, ZoneDetector.currentZone)
-            delay(10000)
+            Log.d(TAG, "checkForHelpRequest() as helper=$userName")
+            viewModel.checkForHelpRequest(currentUserName = userName)
+            delay(10_000)
         }
     }
 
-
-
+    // Session closed → cleanup
     LaunchedEffect(status) {
         if (status == "closed") {
-            Log.d("HomeScreen", "Session closed. Cleaning up.")
-
+            Log.d(TAG, "Status=closed → cleanup")
             pollingSupervisor.cancelChildren()
             startPolling = false
-
-            // These should already be handled inside CameraServiceProvider.stopStream()
             viewModel.stopStreaming()
-
             isCameraOn.value = false
-            helpRequestedState.value = false
             giveHelpBtnPressed = false
             isDuressDetected.value = false
+        } else if (status != null) {
+            Log.d(TAG, "Session status: $status")
         }
     }
 
-
-
+    // Dispose: stop stream if screen leaves
     DisposableEffect(Unit) {
         onDispose {
-            Log.d("HomeScreen", "Disposing HomeScreen: stopping stream")
+            Log.d(TAG, "HomeScreen dispose → stopStreaming()")
             viewModel.stopStreaming()
         }
     }
 
-
-    // ❶ Broadcaster (Victim)
-    LaunchedEffect(helpRequested) {
-        if (helpRequested && viewModel.broadcasterWs != null) {
-            viewModel.initBroadcasterSignaling(
-                context = context,
-                wsUrl = viewModel.broadcasterWs!!,
-                roomId = viewModel.roomId ?: "unknown-room"
-            )
-        } else {
-            viewModel.releaseWebRTC()
+    // Victim: poll for helper assignment while waiting
+    LaunchedEffect(startPolling) {
+        pollingSupervisor.cancelChildren()
+        if (startPolling) {
+            Log.d(TAG, "Start polling for helper")
+            pollingScope.launch {
+                while (isActive) {
+                    try {
+                        withTimeoutOrNull(5_000) { viewModel.listenForHelper(userName) }
+                        delay(10_000)
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Polling error: ${e.message}", e)
+                    }
+                }
+            }
         }
     }
 
-    LaunchedEffect(giveHelpBtnPressed) {
-        if (giveHelpBtnPressed && viewModel.viewerWebsocketUrl != null) {
-            viewModel.initViewerSignaling(
-                context = context,
-                wsUrl = viewModel.viewerWebsocketUrl!!,
-                roomId = viewModel.roomId ?: "unknown-room"
-            )
-        } else {
-            viewModel.releaseViewerWebRTC()
+    // Helper: when Give Help is pressed, auto start HELPER stream
+    LaunchedEffect(giveHelpBtnPressed, viewerWs, roomId) {
+        if (giveHelpBtnPressed && !viewerWs.isNullOrBlank() && !roomId.isNullOrBlank()) {
+            Log.d(TAG, "Helper join: viewerWs=$viewerWs roomId=$roomId state=$streamingState")
+            if (streamingState == StreamingState.Idle) {
+                viewModel.startStreaming(
+                    wsUrl = viewerWs!!,
+                    roomId = roomId!!,
+                    role = CameraServiceProvider.StreamRole.HELPER
+                ) { track: VideoTrack ->
+                    Log.d(TAG, "Helper received remote track")
+                    viewModel.setIncomingVideoTrack(track)
+                }
+            }
         }
     }
 
@@ -186,6 +187,7 @@ fun HomeScreen(
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
+            // ---------------------- Live Video Feed -----------------------------
             ReusableBoxWithHeader(height = 220.dp, title = "Live Video Feed") {
                 Column(
                     modifier = Modifier
@@ -193,33 +195,44 @@ fun HomeScreen(
                         .padding(horizontal = 8.dp),
                     verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
+                    // Victim local preview UI
                     if (isCameraOn.value && isSignalingReady) {
+                        Log.d(TAG, "Render CameraView (isCameraOn=${isCameraOn.value}, signaling=$isSignalingReady)")
                         CameraView(
                             viewModel = viewModel,
                             modifier = Modifier.fillMaxWidth()
                         )
                     }
 
+                    // Helper remote view
                     HelperLiveStreamView(
                         helperAssigned = giveHelpBtnPressed,
                         sessionStatus = status,
                         videoTrack = videoTrack
                     )
 
-                    val isStreaming = viewModel.isStreaming()
-                    val isSignalingReady by viewModel.isSignalingReady.collectAsState()
+                    // Victim Start/Stop button
+                    val isStreaming = streamingState == StreamingState.Streaming
+                    val canStartVictim = (status == "open") && !giveHelpBtnPressed
 
-                    if (isSignalingReady && giveHelpBtnPressed) {
+                    if (canStartVictim) {
                         Button(
                             onClick = {
                                 if (isStreaming) {
+                                    Log.d(TAG, "Victim: Stop stream tapped")
                                     viewModel.stopStreaming()
                                 } else {
-                                    viewModel.startStreaming(
-                                        wsUrl = viewModel.broadcasterWs ?: return@Button,
-                                        roomId = viewModel.roomId ?: "unknown-room"
-                                    ) { track ->
-                                        viewModel.setIncomingVideoTrack(track)
+                                    val ws = broadcasterWs
+                                    val rid = roomId
+                                    Log.d(TAG, "Victim: Start stream tapped ws=$ws room=$rid")
+                                    if (!ws.isNullOrBlank() && !rid.isNullOrBlank()) {
+                                        viewModel.startStreaming(
+                                            wsUrl = ws,
+                                            roomId = rid,
+                                            role = CameraServiceProvider.StreamRole.VICTIM
+                                        ) { /* Victim ignores remote */ }
+                                    } else {
+                                        Log.w(TAG, "Cannot start: broadcasterWs or roomId is null")
                                     }
                                 }
                             },
@@ -233,7 +246,7 @@ fun HomeScreen(
                 }
             }
 
-
+            // ---------------------- Zone Map -----------------------------------
             ReusableBoxWithHeader(height = 300.dp, title = "Zone Map") {
                 MapView(context)
                 ZoneView(isDuressDetected = isDuressDetected.value, context = context)
@@ -243,6 +256,7 @@ fun HomeScreen(
                 }
             }
 
+            // ---------------------- Distance Meter ------------------------------
             ReusableBoxWithHeader(height = 100.dp, title = "Real Time Distance Meter") {
                 if (giveHelpBtnPressed && !helperName.isNullOrEmpty()) {
                     DistanceMeter(context2)
@@ -251,6 +265,7 @@ fun HomeScreen(
                 }
             }
 
+            // ---------------------- CTAs / Status -------------------------------
             ReusableBoxWithHeader(showHeader = false) {
                 Column(
                     modifier = Modifier
@@ -267,8 +282,9 @@ fun HomeScreen(
                     }
 
                     if (giveHelpBtnPressed) {
+                        val req = viewModel.requestingUser
                         Text(
-                            text = "You Are Helping ${requestingUser?.name} in ${requestingUser?.zone}",
+                            text = "You Are Helping ${req?.name ?: "Unknown"} in ${req?.zone ?: "Unknown"}",
                             modifier = Modifier.padding(top = 4.dp)
                         )
                     }
@@ -281,16 +297,17 @@ fun HomeScreen(
                             onClick = {
                                 isDuressDetected.value = !isDuressDetected.value
                                 if (isDuressDetected.value) {
+                                    Log.d(TAG, "Duress pressed → sendHelpRequest")
                                     viewModel.setStreamingState(StreamingState.Signaling)
-                                    viewModel.sendHelpRequest(ZoneDetector.currentZone) {
-                                        helpRequestedState.value = true
+                                    viewModel.sendHelpRequest(ZoneDetector.currentZone.value) {
                                         startPolling = true
                                         isCameraOn.value = true
                                     }
                                 } else {
-                                    requestingUser?.let { user ->
+                                    Log.d(TAG, "Finish pressed → help_completed")
+                                    viewModel.requestingUser?.let { user ->
                                         viewModel.sendHelpCompleted(
-                                            name = user.name,
+                                            victimName = user.name,
                                             helper = userName
                                         ) {
                                             giveHelpBtnPressed = false
@@ -311,32 +328,13 @@ fun HomeScreen(
         }
     }
 
-    LaunchedEffect(startPolling) {
-        pollingSupervisor.cancelChildren() // Cancel any previous polling
-        if (startPolling) {
-            pollingScope.launch {
-                while (isActive) {
-                    try {
-                        withTimeoutOrNull(5000) {
-                            viewModel.listenForHelper(userName)
-                        }
-                        delay(10000)
-                    } catch (e: Exception) {
-                        Log.e("HomeScreen", "Polling error: ${e.message}", e)
-                    }
-                }
-            }
-        }
-    }
-
-    // Incoming Help Request Dialog
+    // ---------------- Incoming Help Request Dialog (Helper) --------------------
     helpRequest?.let {
-        if (it.name != userName && !dialogVisible) {
-            dialogVisible = true
-        }
+        if (it.name != userName && !dialogVisible) dialogVisible = true
         if (dialogVisible) {
             AlertDialog(
                 onDismissRequest = {
+                    Log.d(TAG, "Help dialog dismissed")
                     dialogVisible = false
                     viewModel.clearHelpRequest()
                 },
@@ -344,23 +342,20 @@ fun HomeScreen(
                 text = { Text("${it.name} in ${it.zone} needs assistance.") },
                 confirmButton = {
                     Button(onClick = {
+                        Log.d(TAG, "Give Help confirmed for ${it.name}")
                         viewModel.setRequestingUser(it)
-                        viewModel.sendGiveHelpRequest(it.name, userName) {}
+                        viewModel.sendGiveHelpRequest(it.name, userName) { /* server enforces single-helper */ }
                         giveHelpBtnPressed = true
                         isDuressDetected.value = true
                         dialogVisible = false
-                        ZoneDetector.currentZone = it.zone
-                    }) {
-                        Text("Give Help")
-                    }
+                    }) { Text("Give Help") }
                 },
                 dismissButton = {
                     Button(onClick = {
+                        Log.d(TAG, "Help dialog dismissed via button")
                         dialogVisible = false
                         viewModel.clearHelpRequest()
-                    }) {
-                        Text("Dismiss")
-                    }
+                    }) { Text("Dismiss") }
                 }
             )
         }

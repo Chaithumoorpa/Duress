@@ -3,22 +3,17 @@ package com.techm.duress.viewmodel
 import android.app.Application
 import android.content.Context
 import android.util.Log
-import androidx.camera.view.PreviewView
 import androidx.lifecycle.AndroidViewModel
-import androidx.lifecycle.LifecycleOwner
-import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.techm.duress.core.camera.CameraServiceProvider
-import com.techm.duress.core.webrtc.SignalingSocket
-import com.techm.duress.core.webrtc.WebRTCClient
+import com.techm.duress.core.camera.CameraServiceProvider.StreamRole
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
-import org.webrtc.IceCandidate
-import org.webrtc.SessionDescription
+import org.webrtc.SurfaceViewRenderer
 import org.webrtc.VideoTrack
 import java.io.OutputStreamWriter
 import java.net.HttpURLConnection
@@ -27,454 +22,363 @@ import java.net.URLEncoder
 
 data class HelpRequest(val name: String, val zone: String)
 
-enum class StreamingState {
-    Idle, Previewing, Signaling, Streaming
-}
+enum class StreamingState { Idle, Signaling, Streaming }
 
+class MainViewModel(app: Application) : AndroidViewModel(app) {
 
-class MainViewModel(application: Application) : AndroidViewModel(application) {
+    // --- Config ---------------------------------------------------------------
+    var baseUrl: String = "http://10.246.34.42:8080/duress" // TODO: inject via settings/env
 
+    // --- User/session model ---------------------------------------------------
+    private val _userName = MutableStateFlow("")
+    val userName: StateFlow<String> = _userName
 
-    // IMPORTANT: Replace with your Go server's IP address and port
-    var baseUrl: String = "http://10.246.34.245:8080/duress"
+    private val _role = MutableStateFlow(StreamRole.VICTIM)
+    val role: StateFlow<StreamRole> = _role
 
-    var userName: String = ""
-        private set
+    private val _roomId = MutableStateFlow<String?>(null)
+    val roomId: StateFlow<String?> = _roomId
 
-    private val _helpRequest = MutableStateFlow<HelpRequest?>(null)
-    val helpRequest: StateFlow<HelpRequest?> = _helpRequest
+    private val _broadcasterWs = MutableStateFlow<String?>(null)
+    val broadcasterWs: StateFlow<String?> = _broadcasterWs
 
-    private val _helperName = MutableStateFlow<String?>(null)
+    private val _viewerWs = MutableStateFlow<String?>(null)
+    val viewerWs: StateFlow<String?> = _viewerWs
+
+    private val _helperName = MutableStateFlow<String?>(null)      // who’s helping me (Victim path)
     val helperName: StateFlow<String?> = _helperName
 
-    private val _status = MutableStateFlow<String?>(null)
-    val status: StateFlow<String?> = _status
+    private val _helpRequest = MutableStateFlow<HelpRequest?>(null) // incoming open request I can accept
+    val helpRequest: StateFlow<HelpRequest?> = _helpRequest
 
-    var requestingUser: HelpRequest? = null
-        private set
-
-    var roomId: String? = null
-    var streamId: String? = null
-    var broadcasterWs: String? = null
-    var viewerWebsocketUrl: String? = null
-
-    private val _incomingVideoTrack = MutableStateFlow<VideoTrack?>(null)
-    val incomingVideoTrack: StateFlow<VideoTrack?> = _incomingVideoTrack
+    private val _sessionStatus = MutableStateFlow<String?>(null)   // "open" | "taken" | "closed"
+    val sessionStatus: StateFlow<String?> = _sessionStatus
 
     private val _isHelpSessionActive = MutableStateFlow(false)
     val isHelpSessionActive: StateFlow<Boolean> = _isHelpSessionActive
 
-    private val _helpRequested = MutableStateFlow(false)
-    val helpRequested: StateFlow<Boolean> = _helpRequested
-
-    private val _streamError = MutableStateFlow<String?>(null)
-    val streamError: StateFlow<String?> = _streamError
-
-    private val _isSignalingReady = MutableStateFlow(false)
+    private val _isSignalingReady = MutableStateFlow(false)        // turns true when helper is assigned
     val isSignalingReady: StateFlow<Boolean> = _isSignalingReady
-
-    private var signalingSocket: SignalingSocket? = null
-    private var webRTCClient: WebRTCClient? = null
-
-    private var viewerSocket: SignalingSocket? = null
-    private var viewerWebRTCClient: WebRTCClient? = null
 
     private val _streamingState = MutableStateFlow(StreamingState.Idle)
     val streamingState: StateFlow<StreamingState> = _streamingState
 
-    fun setStreamingState(state: StreamingState) {
-        _streamingState.value = state
+    private val _incomingRemoteVideoTrack = MutableStateFlow<VideoTrack?>(null)
+    val incomingRemoteVideoTrack: StateFlow<VideoTrack?> = _incomingRemoteVideoTrack
+
+    private val _streamError = MutableStateFlow<String?>(null)
+    val streamError: StateFlow<String?> = _streamError
+
+    // For helper status text & finish action
+    private val _requestingUser = MutableStateFlow<HelpRequest?>(null)
+    val requestingUser: HelpRequest? get() = _requestingUser.value
+    fun setRequestingUser(req: HelpRequest) { _requestingUser.value = req }
+
+    // --- RTC encapsulated in provider ----------------------------------------
+    private val cameraProvider = CameraServiceProvider()
+
+    fun attachLocalRenderer(renderer: SurfaceViewRenderer?) {
+        cameraProvider.setLocalPreviewSink(renderer)
     }
 
     fun setIncomingVideoTrack(track: VideoTrack) {
-        _incomingVideoTrack.value = track
+        _incomingRemoteVideoTrack.value = track
     }
 
-
-    fun setUserInfo(name: String) {
-        userName = name
+    fun setUserInfo(name: String) { _userName.value = name }
+    fun setRole(newRole: StreamRole) { _role.value = newRole }
+    fun setStreamingState(state: StreamingState) { _streamingState.value = state }
+    fun setRoom(id: String?) { _roomId.value = id }
+    fun setSockets(broadcaster: String?, viewer: String?) {
+        _broadcasterWs.value = broadcaster
+        _viewerWs.value = viewer
     }
+    fun markSignalingReady(ready: Boolean) { _isSignalingReady.value = ready }
 
-    fun setRequestingUser(user: HelpRequest) {
-        requestingUser = user
-    }
-
-    fun sendHelpRequest(currentUserZone: String, onComplete: () -> Unit = {}) {
+    // --- Victim: create duress ------------------------------------------------
+    fun sendHelpRequest(
+        currentUserZone: String,
+        mobile: String = "123456789",
+        onComplete: () -> Unit = {}
+    ) {
         viewModelScope.launch(Dispatchers.IO) {
             try {
                 val url = URL("$baseUrl/help")
-                val conn = url.openConnection() as HttpURLConnection
-                conn.requestMethod = "POST"
-                conn.setRequestProperty("Content-Type", "application/json")
-                conn.doOutput = true
-
-                val json = JSONObject().apply {
-                    put("name", userName)
+                val conn = (url.openConnection() as HttpURLConnection).apply {
+                    requestMethod = "POST"
+                    setRequestProperty("Content-Type", "application/json")
+                    doOutput = true
+                }
+                val payload = JSONObject().apply {
+                    // Server currently expects "name" & "zone" per your existing code
+                    put("name", _userName.value)
                     put("zone", currentUserZone)
-                    put("mobile", "123456789") // Placeholder, ideally from user input
+                    put("mobile", mobile)
                 }
-
-                OutputStreamWriter(conn.outputStream).use { writer ->
-                    writer.write(json.toString())
-                    writer.flush()
-                }
+                OutputStreamWriter(conn.outputStream).use { it.write(payload.toString()) }
 
                 if (conn.responseCode == HttpURLConnection.HTTP_OK) {
-                    val response = conn.inputStream.bufferedReader().readText()
-                    Log.d("HelpRequest Response", response)
+                    val body = conn.inputStream.bufferedReader().use { it.readText() }
+                    val js = JSONObject(body)
+                    val room = js.optString("roomId").ifBlank { null }
+                    val bws = js.optString("broadcasterWs").ifBlank { null }
+                    val vws = js.optString("viewerWebsocketUrl").ifBlank { null }
 
-                    val jsonResponse = JSONObject(response)
-                    roomId = jsonResponse.optString("roomId")
-                    streamId = jsonResponse.optString("streamId")
-                    broadcasterWs = jsonResponse.optString("broadcasterWs")
-                    viewerWebsocketUrl = jsonResponse.optString("viewerWebsocketUrl")
-
-                    Log.d("DuressMeta", "roomId=$roomId, streamId=$streamId")
-                    Log.d("DuressMeta", "broadcasterWs=$broadcasterWs")
-                    Log.d("DuressMeta", "viewerWebsocketUrl=$viewerWebsocketUrl")
                     withContext(Dispatchers.Main) {
-                        _helpRequested.value = true
+                        _roomId.value = room
+                        _broadcasterWs.value = bws
+                        _viewerWs.value = vws
+                        _isHelpSessionActive.value = true
+                        _sessionStatus.value = "open"
+                        _isSignalingReady.value = false
                         onComplete()
                     }
                 } else {
-                    Log.e("HelpRequest", "Error: ${conn.responseCode} - ${conn.responseMessage}")
+                    Log.e("DU/HTTP", "help: ${conn.responseCode} ${conn.responseMessage}")
                 }
-
                 conn.disconnect()
-            } catch (e: Exception) {
-                e.printStackTrace()
+            } catch (t: Throwable) {
+                Log.w("DU/HTTP", "help failed: ${t.message}")
             }
         }
     }
 
-
-    fun checkForHelpRequest(currentUserName: String, currentUserZone: String) {
+    // --- Helper: poll for open requests --------------------------------------
+    fun checkForHelpRequest(currentUserName: String, currentUserZone: String? = null) {
         viewModelScope.launch(Dispatchers.IO) {
             try {
                 val url = URL("$baseUrl/listen")
-                val conn = url.openConnection() as HttpURLConnection
-                conn.requestMethod = "GET"
-                conn.setRequestProperty("Accept", "application/json")
+                val conn = (url.openConnection() as HttpURLConnection).apply {
+                    requestMethod = "GET"
+                    setRequestProperty("Accept", "application/json")
+                }
 
                 if (conn.responseCode == HttpURLConnection.HTTP_OK) {
-                    val response = conn.inputStream.bufferedReader().readText()
-                    if (response.isNotEmpty() && response!= "null") {
-                        val json = JSONObject(response)
-                        val name = json.optString("name")
-                        val zone = json.optString("zone")
-                        val statusValue = json.optString("status")
+                    val body = conn.inputStream.bufferedReader().use { it.readText() }
+                    val js = body.takeIf { it.isNotBlank() && it != "null" }?.let { JSONObject(it) }
 
-                        if (statusValue == "closed") {
+                    val statusValue = js?.optString("status") ?: "none"
+                    val victim = js?.optString("name").orEmpty()
+                    val zone = js?.optString("zone").orEmpty()
+
+                    withContext(Dispatchers.Main) {
+                        if (statusValue == "closed" ||  victim == currentUserName) {
                             _helpRequest.value = null
-                        } else if (name!= currentUserName) { // Only show requests from others
-                            _helpRequest.value = HelpRequest(name, zone)
                         } else {
-                            _helpRequest.value = null
+                            _helpRequest.value = HelpRequest(victim, zone)
                         }
-                    } else {
-                        _helpRequest.value = null
                     }
                 } else {
-                    Log.e("CheckHelpRequest", "Error: ${conn.responseCode} - ${conn.responseMessage}")
+                    Log.e("DU/HTTP", "listen: ${conn.responseCode} ${conn.responseMessage}")
                 }
                 conn.disconnect()
-            } catch (e: Exception) {
-                e.printStackTrace()
+            } catch (t: Throwable) {
+                Log.w("DU/HTTP", "listen failed: ${t.message}")
             }
         }
     }
 
-    fun sendGiveHelpRequest(name: String, helper: String, onSuccess: () -> Unit) {
+    // --- Helper: accept request (single-helper guarantee on server) -----------
+    fun sendGiveHelpRequest(victimName: String, helper: String, onSuccess: () -> Unit) {
         viewModelScope.launch(Dispatchers.IO) {
             try {
                 val url = URL("$baseUrl/give_help")
-                val postData = "name=${URLEncoder.encode(name, "UTF-8")}&helper=${URLEncoder.encode(helper, "UTF-8")}"
-                val conn = url.openConnection() as HttpURLConnection
-
-                conn.requestMethod = "POST"
-                conn.setRequestProperty("Content-Type", "application/x-www-form-urlencoded")
-                conn.setRequestProperty("Accept", "application/json")
-                conn.doOutput = true
-
-                conn.outputStream.use {
-                    it.write(postData.toByteArray(Charsets.UTF_8))
+                val post = "name=${URLEncoder.encode(victimName, "UTF-8")}" +
+                        "&helper=${URLEncoder.encode(helper, "UTF-8")}"
+                val conn = (url.openConnection() as HttpURLConnection).apply {
+                    requestMethod = "POST"
+                    setRequestProperty("Content-Type", "application/x-www-form-urlencoded")
+                    setRequestProperty("Accept", "application/json")
+                    doOutput = true
                 }
+                conn.outputStream.use { it.write(post.toByteArray(Charsets.UTF_8)) }
 
                 if (conn.responseCode == HttpURLConnection.HTTP_OK) {
-                    val response = conn.inputStream.bufferedReader().readText()
-                    val json = JSONObject(response)
-                    Log.d("GiveHelpRequest", "Response: $response")
-                    if (json.optString("status") == "success") {
+                    val body = conn.inputStream.bufferedReader().use { it.readText() }
+                    val js = JSONObject(body)
+                    if (js.optString("status") == "success") {
                         withContext(Dispatchers.Main) { onSuccess() }
+                    } else {
+                        Log.w("DU/HTTP", "give_help unexpected: $body")
                     }
                 } else {
-                    Log.e("GiveHelpRequest", "Error: ${conn.responseCode} - ${conn.responseMessage}")
+                    Log.e("DU/HTTP", "give_help: ${conn.responseCode} ${conn.responseMessage}")
                 }
-
                 conn.disconnect()
-            } catch (e: Exception) {
-                e.printStackTrace()
+            } catch (t: Throwable) {
+                Log.w("DU/HTTP", "give_help failed: ${t.message}")
             }
         }
     }
 
-    fun listenForHelper(userName: String) {
+
+    // --- Victim: wait for helper assignment -----------------------------------
+    fun listenForHelper(victimName: String) {
         viewModelScope.launch(Dispatchers.IO) {
             try {
                 val url = URL("$baseUrl/listen_for_helper")
-                val postData = "name=${URLEncoder.encode(userName, "UTF-8")}"
-                val conn = url.openConnection() as HttpURLConnection
-
-                conn.requestMethod = "POST"
-                conn.setRequestProperty("Content-Type", "application/x-www-form-urlencoded")
-                conn.setRequestProperty("Accept", "application/json")
-                conn.doOutput = true
-
-                conn.outputStream.use {
-                    it.write(postData.toByteArray(Charsets.UTF_8))
+                val post = "name=${URLEncoder.encode(victimName, "UTF-8")}"
+                val conn = (url.openConnection() as HttpURLConnection).apply {
+                    requestMethod = "POST"
+                    setRequestProperty("Content-Type", "application/x-www-form-urlencoded")
+                    setRequestProperty("Accept", "application/json")
+                    doOutput = true
                 }
+                conn.outputStream.use { it.write(post.toByteArray(Charsets.UTF_8)) }
 
                 if (conn.responseCode == HttpURLConnection.HTTP_OK) {
-                    val response = conn.inputStream.bufferedReader().readText()
-                    if (response.isNotEmpty() && response!= "null") {
-                        val json = JSONObject(response)
-                        val helper = json.optString("helper")
-                        val statusValue = json.optString("status")
+                    val body = conn.inputStream.bufferedReader().use { it.readText() }
+                    val js = body.takeIf { it.isNotBlank() && it != "null" }?.let { JSONObject(it) }
 
-                        _status.value = statusValue
-                        _isHelpSessionActive.value = statusValue == "open" // Correctly reflects active session
+                    val helper = js?.optString("helper")?.ifBlank { null }
+                    val statusValue = js?.optString("status") // may be null
 
+                    withContext(Dispatchers.Main) {
                         if (statusValue == "closed") {
                             _helperName.value = null
+                            _sessionStatus.value = "closed"
+                            _isHelpSessionActive.value = false
+                            _isSignalingReady.value = false
+                            Log.d("DU/HTTP", "listen_for_helper → closed")
                         } else {
-                            _helperName.value = helper
+                            if (!helper.isNullOrBlank()) {
+                                _helperName.value = helper
+                                _isHelpSessionActive.value = true
+                                _sessionStatus.value = statusValue ?: "open"
+                                _isSignalingReady.value = true
+                                Log.d("DU/HTTP", "listen_for_helper → helper=$helper, status=${statusValue ?: "open"}")
+                            } else {
+                                Log.d("DU/HTTP", "listen_for_helper → no change")
+                            }
                         }
-
-                        Log.d("HelperInfo", "Helper: $helper, Status: $statusValue")
                     }
                 } else {
-                    Log.e("ListenForHelper", "Error: ${conn.responseCode} - ${conn.responseMessage}")
+                    Log.e("DU/HTTP", "listen_for_helper: ${conn.responseCode} ${conn.responseMessage}")
                 }
-
                 conn.disconnect()
-            } catch (e: Exception) {
-                e.printStackTrace()
+            } catch (t: Throwable) {
+                Log.w("DU/HTTP", "listen_for_helper failed: ${t.message}")
             }
         }
     }
 
-    fun sendHelpCompleted(name: String, helper: String, onSuccess: () -> Unit) {
+
+
+    // --- Either role: finish session ------------------------------------------
+    fun sendHelpCompleted(victimName: String, helper: String, onSuccess: () -> Unit) {
         viewModelScope.launch(Dispatchers.IO) {
             try {
                 val url = URL("$baseUrl/help_completed")
-                val postData = "name=${URLEncoder.encode(name, "UTF-8")}&helper=${URLEncoder.encode(helper, "UTF-8")}"
-                val conn = url.openConnection() as HttpURLConnection
-
-                conn.requestMethod = "POST"
-                conn.setRequestProperty("Content-Type", "application/x-www-form-urlencoded")
-                conn.setRequestProperty("Accept", "application/json")
-                conn.doOutput = true
-
-                conn.outputStream.use {
-                    it.write(postData.toByteArray(Charsets.UTF_8))
+                val post = "name=${URLEncoder.encode(victimName, "UTF-8")}" +
+                        "&helper=${URLEncoder.encode(helper, "UTF-8")}"
+                val conn = (url.openConnection() as HttpURLConnection).apply {
+                    requestMethod = "POST"
+                    setRequestProperty("Content-Type", "application/x-www-form-urlencoded")
+                    setRequestProperty("Accept", "application/json")
+                    doOutput = true
                 }
+                conn.outputStream.use { it.write(post.toByteArray(Charsets.UTF_8)) }
 
                 if (conn.responseCode == HttpURLConnection.HTTP_OK) {
-                    val response = conn.inputStream.bufferedReader().readText()
-                    val json = JSONObject(response)
-                    if (json.optString("status") == "success") {
-                        withContext(Dispatchers.Main) {
-                            onSuccess()
-                            roomId = null
-                            streamId = null
-                            broadcasterWs = null
-                            viewerWebsocketUrl = null
-                            _isHelpSessionActive.value = false
-                            _incomingVideoTrack.value = null // Clear video track on completion
-                            _streamingState.value = StreamingState.Idle
-                        }
+                    val body = conn.inputStream.bufferedReader().use { it.readText() }
+                    val js = JSONObject(body)
+                    if (js.optString("status") == "success") {
+                        withContext(Dispatchers.Main) { onSuccess(); teardownSessionState() }
+                    } else {
+                        Log.w("DU/HTTP", "help_completed unexpected: $body")
                     }
                 } else {
-                    Log.e("HelpCompleted", "Error: ${conn.responseCode} - ${conn.responseMessage}")
+                    Log.e("DU/HTTP", "help_completed: ${conn.responseCode} ${conn.responseMessage}")
                 }
-
                 conn.disconnect()
-            } catch (e: Exception) {
-                e.printStackTrace()
+            } catch (t: Throwable) {
+                Log.w("DU/HTTP", "help_completed failed: ${t.message}")
             }
         }
     }
 
-    private var cameraServiceProvider: CameraServiceProvider? = null
 
+    // --- Streaming control (both roles) ---------------------------------------
+    // MainViewModel.kt (replace your startStreaming with this version)
     fun startStreaming(
-        wsUrl: String,
+        wsUrl: String?,              // may be null; we’ll pick from state
         roomId: String,
+        role: StreamRole,
         onRemoteVideo: (VideoTrack) -> Unit
     ) {
-        val context = getApplication<Application>().applicationContext
-        cameraServiceProvider = CameraServiceProvider()
-        viewModelScope.launch {
-            cameraServiceProvider?.startStream(wsUrl, context, roomId, onRemoteVideo)
-        }
-    }
+        val ctx: Context = getApplication<Application>().applicationContext
+        _streamError.value = null
+        _streamingState.value = StreamingState.Signaling
+        _role.value = role
 
-    fun stopStreaming() {
-        viewModelScope.launch {
-            cameraServiceProvider?.stopStream()
-            cameraServiceProvider = null
-        }
-    }
+        viewModelScope.launch(Dispatchers.Default) {
+            try {
+                // pick the correct websocket from args or state (populated by /help)
+                val socketUrl = wsUrl
+                    ?: when (role) {
+                        StreamRole.VICTIM -> _broadcasterWs.value
+                        StreamRole.HELPER -> _viewerWs.value
+                    }
+                    ?: throw IllegalStateException("No websocket URL for role=$role (room=$roomId)")
 
-    fun isStreaming(): Boolean {
-        return cameraServiceProvider?.isStreamActive() == true
-    }
+                Log.d("DU/RTC", "startStreaming → role=$role room=$roomId ws=$socketUrl")
 
-    fun initBroadcasterSignaling(context: Context, wsUrl: String, roomId: String) {
-        viewModelScope.launch(Dispatchers.IO) {
-            Log.d("MainViewModel", "Broadcaster: Initializing WebRTC client and signaling socket.")
+                cameraProvider.startStream(
+                    wsUrl = socketUrl,
+                    context = ctx,
+                    roomId = roomId,
+                    role = role,
+                    onRemoteVideo = onRemoteVideo
+                )
 
-            val socket = SignalingSocket(wsUrl, object : SignalingSocket.Listener {
-                override fun onAnswerReceived(sdp: String) {
-                    Log.d("MainViewModel", "Broadcaster: Received answer from helper.")
-                    webRTCClient?.setRemoteSDP(sdp)
+                withContext(Dispatchers.Main) {
+                    _streamingState.value = StreamingState.Streaming
                     _isSignalingReady.value = true
                 }
-
-                override fun onIceCandidateReceived(candidate: String) {
-                    Log.d("MainViewModel", "Broadcaster: Received ICE candidate from helper.")
-                    webRTCClient?.addRemoteIceCandidate(candidate)
+            } catch (t: Throwable) {
+                Log.w("DU/RTC", "startStreaming error: ${t.message}", t)
+                withContext(Dispatchers.Main) {
+                    _streamError.value = t.message
+                    _streamingState.value = StreamingState.Idle
                 }
-
-                override fun onSocketOpened() {
-                    Log.d("MainViewModel", "Broadcaster: Signaling socket opened. Initializing WebRTC client.")
-
-                    val client = WebRTCClient(context, object : WebRTCClient.SignalingCallback {
-                        override fun onLocalSDPGenerated(sdp: SessionDescription) {
-                            Log.d("MainViewModel", "Broadcaster: Generated local offer, sending to server.")
-                            signalingSocket?.sendOffer(sdp.description, roomId)
-                        }
-
-                        override fun onIceCandidateFound(c: IceCandidate) {
-                            Log.d("MainViewModel", "Broadcaster: Found local ICE candidate, sending to server.")
-                            signalingSocket?.sendCandidate(c.sdp, roomId)
-                        }
-
-                        override fun onRemoteVideoTrackReceived(track: VideoTrack) {
-                            Log.d("MainViewModel", "Broadcaster: Received remote video track.")
-                            // Optional: handle preview or feedback
-                        }
-                    })
-
-                    client.initialize()
-                    webRTCClient = client
-                    client.startLocalVideo(context)
-                }
-
-                override fun onOfferReceived(sdp: String) {
-                    Log.d("MainViewModel", "Broadcaster: Unexpected offer received.")
-                }
-
-                override fun onSocketClosed() {
-                    Log.d("MainViewModel", "Broadcaster Socket Disconnected")
-                    releaseWebRTC()
-                }
-            })
-
-            socket.connect()
-            signalingSocket = socket
+            }
         }
     }
 
-    fun releaseWebRTC() {
-        webRTCClient?.let {
+
+    fun stopStreaming() {
+        viewModelScope.launch(Dispatchers.Default) {
             try {
-                it.release()
-                Log.d("MainViewModel", "WebRTCClient released successfully.")
-            } catch (e: Exception) {
-                Log.e("MainViewModel", "Error releasing WebRTCClient: ${e.message}", e)
+                cameraProvider.stopStream()
+            } catch (t: Throwable) {
+                Log.w("DU/RTC", "stopStream error: ${t.message}")
+            } finally {
+                withContext(Dispatchers.Main) { _streamingState.value = StreamingState.Idle }
             }
         }
-        webRTCClient = null
-        signalingSocket?.disconnect()
-        signalingSocket = null
+    }
+
+    fun isStreaming(): Boolean = cameraProvider.isStreamActive()
+
+    // --- Helpers ---------------------------------------------------------------
+    private fun teardownSessionState() {
+        _roomId.value = null
+        _broadcasterWs.value = null
+        _viewerWs.value = null
+        _incomingRemoteVideoTrack.value = null
+        _isHelpSessionActive.value = false
         _isSignalingReady.value = false
-    }
-
-    fun initViewerSignaling(context: Context, wsUrl: String, roomId: String) {
-        viewModelScope.launch(Dispatchers.IO) {
-            Log.d("MainViewModel", "Helper: Initializing WebRTC client and signaling socket.")
-
-            val socket = SignalingSocket(wsUrl, object : SignalingSocket.Listener {
-                override fun onOfferReceived(sdp: String) {
-                    Log.d("MainViewModel", "Helper: Received offer from broadcaster. Creating answer.")
-
-                    val client = WebRTCClient(context, object : WebRTCClient.SignalingCallback {
-                        override fun onLocalSDPGenerated(sdp: SessionDescription) {
-                            Log.d("MainViewModel", "Helper: Generated local answer, sending to server.")
-                            viewerSocket?.sendAnswer(sdp.description, roomId)
-                        }
-
-                        override fun onIceCandidateFound(c: IceCandidate) {
-                            Log.d("MainViewModel", "Helper: Found local ICE candidate, sending to server.")
-                            viewerSocket?.sendCandidate(c.sdp, roomId)
-                        }
-
-                        override fun onRemoteVideoTrackReceived(track: VideoTrack) {
-                            Log.d("MainViewModel", "Helper: Received remote video track from broadcaster.")
-                            setIncomingVideoTrack(track)
-                        }
-                    })
-
-                    client.initialize(answerMode = true)
-                    client.setRemoteSDP(sdp)
-                    viewerWebRTCClient = client
-                }
-
-                override fun onIceCandidateReceived(candidate: String) {
-                    Log.d("MainViewModel", "Helper: Received ICE candidate from broadcaster.")
-                    viewerWebRTCClient?.addRemoteIceCandidate(candidate)
-                }
-
-                override fun onSocketOpened() {
-                    Log.d("MainViewModel", "Helper: Signaling socket opened.")
-                }
-
-                override fun onAnswerReceived(sdp: String) {
-                    Log.d("MainViewModel", "Helper: Unexpected answer received.")
-                }
-
-                override fun onSocketClosed() {
-                    Log.d("MainViewModel", "Viewer Socket Disconnected")
-                    releaseViewerWebRTC()
-                }
-            })
-
-            socket.connect()
-            viewerSocket = socket
-        }
-    }
-
-    fun releaseViewerWebRTC() {
-        viewerWebRTCClient?.let {
-            try {
-                it.release()
-                Log.d("MainViewModel", "Viewer WebRTCClient released successfully.")
-            } catch (e: Exception) {
-                Log.e("MainViewModel", "Error releasing Viewer WebRTCClient: ${e.message}", e)
-            }
-        }
-        viewerWebRTCClient = null
-        viewerSocket?.disconnect()
-        viewerSocket = null
-    }
-
-
-    fun clearHelpRequest() {
-        _helpRequest.value = null
-    }
-
-    fun resetHelperName() {
+        _streamingState.value = StreamingState.Idle
+        _sessionStatus.value = "closed"
         _helperName.value = null
+        _requestingUser.value = null
+    }
+
+    fun clearHelpRequest() { _helpRequest.value = null }
+    fun resetHelperName() { _helperName.value = null }
+
+    override fun onCleared() {
+        super.onCleared()
+        try { cameraProvider.stopStream() } catch (_: Throwable) {}
     }
 }

@@ -1,27 +1,17 @@
 package com.techm.duress.core.webrtc
 
 import android.util.Log
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
+import kotlinx.coroutines.*
 import okhttp3.*
 import org.json.JSONObject
+import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 
 class SignalingSocket(
     private val websocketUrl: String,
     private val signalingListener: Listener
 ) {
-
-    private var webSocket: WebSocket? = null
-    private var pendingOffer: JSONObject? = null
-
-    private val client = OkHttpClient.Builder()
-        .connectTimeout(10, TimeUnit.SECONDS)
-        .readTimeout(10, TimeUnit.SECONDS)
-        .writeTimeout(10, TimeUnit.SECONDS)
-        .build()
 
     interface Listener {
         fun onOfferReceived(sdp: String)
@@ -31,130 +21,145 @@ class SignalingSocket(
         fun onSocketClosed()
     }
 
+    private val TAG = "DU/WS"
+
+    // OkHttp: readTimeout(0) for WS; ping interval keeps the connection healthy
+    private val client = OkHttpClient.Builder()
+        .connectTimeout(10, TimeUnit.SECONDS)
+        .readTimeout(0, TimeUnit.SECONDS)
+        .writeTimeout(10, TimeUnit.SECONDS)
+        .pingInterval(15, TimeUnit.SECONDS)
+        .build()
+
+    private var webSocket: WebSocket? = null
+    private val isOpen = AtomicBoolean(false)
+
+    // single scope for retries/flush; canceled on disconnect
+    private val job = SupervisorJob()
+    private val scope = CoroutineScope(job + Dispatchers.IO)
+
+    // Queue any outbound messages until socket is open
+    private data class Outgoing(val json: JSONObject)
+    private val outbound = ConcurrentLinkedQueue<Outgoing>()
+
     fun connect() {
         val request = Request.Builder().url(websocketUrl).build()
         webSocket = client.newWebSocket(request, object : WebSocketListener() {
 
             override fun onOpen(ws: WebSocket, response: Response) {
-                Log.d("SignalingSocket", "WebSocket opened: $websocketUrl")
-                pendingOffer?.let {
-                    Log.d("SignalingSocket", "Flushing pending offer...")
-                    webSocket?.send(it.toString())
-                    pendingOffer = null
-                }
+                Log.d(TAG, "OPEN @ $websocketUrl code=${response.code}")
+                isOpen.set(true)
                 signalingListener.onSocketOpened()
+                flushQueued()
             }
 
             override fun onMessage(ws: WebSocket, text: String) {
-                Log.d("SignalingSocket", "Message received: $text")
+                Log.d(TAG, "RECV: $text")
                 try {
                     val json = JSONObject(text)
-                    val event = json.getString("event")
-                    val data = json.getString("data")
+                    val event = json.optString("event", "")
+                    val dataRaw = json.opt("data")
+                    // Normalize "data" to string SDP/candidate
+                    val data = when (dataRaw) {
+                        is String -> dataRaw
+                        is JSONObject -> dataRaw.optString("sdp")
+                            .ifEmpty { dataRaw.optString("candidate", dataRaw.toString()) }
+                        null -> ""
+                        else -> dataRaw.toString()
+                    }
 
                     when (event) {
-                        "offer" -> signalingListener.onOfferReceived(data)
-                        "answer" -> signalingListener.onAnswerReceived(data)
+                        "offer"     -> signalingListener.onOfferReceived(data)
+                        "answer"    -> signalingListener.onAnswerReceived(data)
                         "candidate" -> signalingListener.onIceCandidateReceived(data)
-                        else -> Log.w("SignalingSocket", "Unknown event: $event")
+                        else        -> Log.w(TAG, "Unknown event: $event")
                     }
-                } catch (e: Exception) {
-                    Log.e("SignalingSocket", "Error parsing message: ${e.message}", e)
+                } catch (t: Throwable) {
+                    Log.w(TAG, "Parse error: ${t.message}")
                 }
             }
 
             override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) {
-                Log.e("SignalingSocket", "WebSocket error: ${t.message}", t)
+                Log.w(TAG, "FAIL: ${t.message} code=${response?.code}")
+                isOpen.set(false)
                 signalingListener.onSocketClosed()
             }
 
             override fun onClosed(ws: WebSocket, code: Int, reason: String) {
-                Log.d("SignalingSocket", "WebSocket closed: $reason (Code: $code)")
+                Log.d(TAG, "CLOSED code=$code reason=$reason")
+                isOpen.set(false)
                 signalingListener.onSocketClosed()
             }
         })
     }
 
-    fun sendOffer(sdp: String, roomId: String) {
-        try {
-            val offerJson = JSONObject().apply {
-                put("event", "offer")
-                put("data", sdp)
-                put("roomId", roomId)
-            }
+    fun sendOffer(sdp: String, roomId: String) = send("offer", sdp, roomId)
+    fun sendAnswer(sdp: String, roomId: String) = send("answer", sdp, roomId)
+    fun sendCandidate(candidate: String, roomId: String) = send("candidate", candidate, roomId)
 
-            if (isSocketReady()) {
-                Log.d("SignalingSocket", "Sending offer immediately...")
-                webSocket?.send(offerJson.toString())
+    private fun send(event: String, data: String, roomId: String) {
+        val obj = JSONObject()
+            .put("event", event)
+            .put("data", data)
+            .put("roomId", roomId)
+
+        if (isOpen.get()) {
+            val ok = webSocket?.send(obj.toString()) ?: false
+            if (!ok) {
+                Log.w(TAG, "Send failed (ws null); queueing $event")
+                outbound.add(Outgoing(obj))
             } else {
-                Log.w("SignalingSocket", "WebSocket not ready. Queuing offer...")
-                pendingOffer = offerJson
-                retrySendingOffer(offerJson, attempt = 1)
+                Log.d(TAG, "SEND $event size=${obj.toString().length}")
             }
-
-        } catch (e: Exception) {
-            Log.e("SignalingSocket", "Failed to send offer: ${e.message}", e)
+        } else {
+            Log.d(TAG, "WS not open; queueing $event")
+            outbound.add(Outgoing(obj))
+            scheduleFlushBackoff()
         }
     }
 
-    private fun isSocketReady(): Boolean {
-        return webSocket != null // You can enhance with custom readyState logic if needed
+    private fun flushQueued() {
+        scope.launch {
+            var count = 0
+            while (true) {
+                val msg = outbound.poll() ?: break
+                val ok = webSocket?.send(msg.json.toString()) ?: false
+                if (ok) {
+                    count++
+                } else {
+                    // if send fails, re-queue and retry later
+                    outbound.add(msg)
+                    break
+                }
+            }
+            if (count > 0) Log.d(TAG, "Flushed $count queued messages")
+        }
     }
 
-    private fun retrySendingOffer(offerJson: JSONObject, attempt: Int) {
-        val maxAttempts = 5
-        val delayMillis = 500L * attempt
-
-        if (attempt > maxAttempts) {
-            Log.e("SignalingSocket", "Max retry attempts reached. Offer discarded.")
-            return
-        }
-
-        CoroutineScope(Dispatchers.IO).launch {
-            delay(delayMillis)
-            if (isSocketReady()) {
-                Log.d("SignalingSocket", "Retrying offer... attempt $attempt")
-                webSocket?.send(offerJson.toString())
-                pendingOffer = null
-            } else {
-                Log.w("SignalingSocket", "WebSocket still not ready. Retrying offer...")
-                retrySendingOffer(offerJson, attempt + 1)
+    private var backoffJob: Job? = null
+    private fun scheduleFlushBackoff() {
+        if (backoffJob?.isActive == true) return
+        backoffJob = scope.launch {
+            repeat(5) { i ->
+                delay(500L * (i + 1))
+                if (isOpen.get()) {
+                    flushQueued()
+                    return@launch
+                }
             }
         }
     }
 
-    fun sendAnswer(sdp: String, roomId: String) {
-        try {
-            val json = JSONObject().apply {
-                put("event", "answer")
-                put("data", sdp)
-                put("roomId", roomId)
-            }
-            Log.d("SignalingSocket", "Sending answer: $sdp to room: $roomId")
+    fun isConnected(): Boolean = isOpen.get()
 
-            webSocket?.send(json.toString())
-                ?: Log.e("SignalingSocket", "WebSocket not connected to send answer")
-        } catch (e: Exception) {
-            Log.e("SignalingSocket", "Failed to send answer: ${e.message}", e)
-        }
-    }
-
-    fun sendCandidate(candidate: String, roomId: String) {
-        try {
-            val json = JSONObject().apply {
-                put("event", "candidate")
-                put("data", candidate)
-                put("roomId", roomId)
-            }
-            webSocket?.send(json.toString())
-                ?: Log.e("SignalingSocket", "WebSocket not connected to send candidate")
-        } catch (e: Exception) {
-            Log.e("SignalingSocket", "Failed to send candidate: ${e.message}", e)
-        }
-    }
-
-    fun disconnect() {
-        webSocket?.close(1000, "Client disconnected")
+    fun close(code: Int = 1000, reason: String = "Client closing") {
+        try { webSocket?.close(code, reason) } catch (_: Throwable) {}
         webSocket = null
+        isOpen.set(false)
+        outbound.clear()
+        job.cancel()
+        Log.d(TAG, "Closed($code): $reason")
     }
+
+    fun disconnect() = close(1000, "Client disconnected")
 }

@@ -1,8 +1,9 @@
 package com.techm.duress.views.widgets
 
-import android.content.Context
 import androidx.compose.foundation.layout.*
-import androidx.compose.material3.*
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -10,6 +11,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import org.webrtc.EglBase
+import org.webrtc.RendererCommon
 import org.webrtc.SurfaceViewRenderer
 import org.webrtc.VideoTrack
 
@@ -27,28 +29,45 @@ fun HelperLiveStreamView(
     val context = LocalContext.current
     val eglBase = remember { EglBase.create() }
 
+    // hold a reference to the renderer so we can detach/release cleanly
+    var rendererRef by remember { mutableStateOf<SurfaceViewRenderer?>(null) }
+
     val shouldRender = helperAssigned && sessionStatus == "open" && videoTrack != null
 
     Box(
         modifier = Modifier
-            .fillMaxSize()
+            .fillMaxWidth()
+            .height(200.dp)
             .padding(8.dp),
         contentAlignment = Alignment.Center
     ) {
         if (shouldRender) {
             AndroidView(
+                modifier = Modifier.fillMaxSize(),
                 factory = {
                     SurfaceViewRenderer(context).apply {
-                        init(eglBase.eglBaseContext, null)
-                        videoTrack.addSink(this)
+                        init(eglBase.eglBaseContext, /* rendererEvents = */ null)
+                        setEnableHardwareScaler(true)
+                        setScalingType(RendererCommon.ScalingType.SCALE_ASPECT_FIT)
+                        setMirror(false)
+                        rendererRef = this
                     }
                 },
-                modifier = Modifier.fillMaxSize(),
-                onRelease = {
-                    videoTrack.removeSink(it)
-                    it.release()
-                }
+                update = { /* no-op; sink is handled via DisposableEffect below */ }
             )
+
+            // Attach/detach sink exactly when track or renderer changes
+            DisposableEffect(videoTrack, rendererRef) {
+                val r = rendererRef
+                if (videoTrack != null && r != null) {
+                    videoTrack.addSink(r)
+                }
+                onDispose {
+                    if (videoTrack != null && r != null) {
+                        videoTrack.removeSink(r)
+                    }
+                }
+            }
         } else {
             Column(
                 horizontalAlignment = Alignment.CenterHorizontally,
@@ -61,6 +80,15 @@ fun HelperLiveStreamView(
                     style = MaterialTheme.typography.bodyMedium
                 )
             }
+        }
+    }
+
+    // Release EGL + renderer when this composable leaves the composition
+    DisposableEffect(Unit) {
+        onDispose {
+            try { rendererRef?.release() } catch (_: Throwable) {}
+            rendererRef = null
+            try { eglBase.release() } catch (_: Throwable) {}
         }
     }
 }
