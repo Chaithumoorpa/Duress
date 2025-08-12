@@ -296,7 +296,7 @@ class WebRTCClient(
         createOffer()
     }
 
-    private fun createOffer() {
+     fun createOffer() {
         val pc = peerConnection ?: return
         CoroutineScope(Dispatchers.Default).launch {
             pc.createOffer(object : SdpObserver {

@@ -3,11 +3,11 @@
   <component name="deploymentTargetSelector">
     <selectionStates>
       <SelectionState runConfigName="app">
-        <option name="selectionMode" value="DROPDOWN" />
-        <DropdownSelection timestamp="2025-08-12T06:21:33.968075300Z">
+        <option name="selectionMode" value="DIALOG" />
+        <DropdownSelection timestamp="2025-08-12T14:18:15.426165900Z">
           <Target type="DEFAULT_BOOT">
             <handle>
-              <DeviceId pluginId="Default" identifier="serial=HZQL1849BAK82800234;connection=14e249de" />
+              <DeviceId pluginId="Default" identifier="serial=HZQL1849BAK82800234;connection=783bebe4" />
             </handle>
           </Target>
         </DropdownSelection>
@@ -15,12 +15,12 @@
           <targets>
             <Target type="DEFAULT_BOOT">
               <handle>
-                <DeviceId pluginId="LocalEmulator" identifier="path=C:\Users\Chaithanya\.android\avd\Medium_Phone.avd" />
+                <DeviceId pluginId="Default" identifier="serial=HZQL1849BAK82800234;connection=74d1ead2" />
               </handle>
             </Target>
             <Target type="DEFAULT_BOOT">
               <handle>
-                <DeviceId pluginId="Default" identifier="serial=HZQL1849BAK82800234;connection=9e05e73e" />
+                <DeviceId pluginId="LocalEmulator" identifier="path=C:\Users\Chaithanya\.android\avd\Pixel_9_Pro.avd" />
               </handle>
             </Target>
           </targets>

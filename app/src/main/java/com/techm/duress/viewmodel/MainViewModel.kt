@@ -20,14 +20,18 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
 
+// ---------------------------- Data ----------------------------
+
 data class HelpRequest(val name: String, val zone: String)
 
 enum class StreamingState { Idle, Signaling, Streaming }
 
+// ------------------------ ViewModel ---------------------------
+
 class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     // --- Config ---------------------------------------------------------------
-    var baseUrl: String = "http://10.246.34.42:8080/duress" // TODO: inject via settings/env
+    var baseUrl: String = "http://10.246.34.42:8080/duress" // TODO: inject/env for prod
 
     // --- User/session model ---------------------------------------------------
     private val _userName = MutableStateFlow("")
@@ -45,7 +49,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     private val _viewerWs = MutableStateFlow<String?>(null)
     val viewerWs: StateFlow<String?> = _viewerWs
 
-    private val _helperName = MutableStateFlow<String?>(null)      // who’s helping me (Victim path)
+    private val _helperName = MutableStateFlow<String?>(null) // who’s helping me (Victim path)
     val helperName: StateFlow<String?> = _helperName
 
     private val _helpRequest = MutableStateFlow<HelpRequest?>(null) // incoming open request I can accept
@@ -95,34 +99,50 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     }
     fun markSignalingReady(ready: Boolean) { _isSignalingReady.value = ready }
 
-    // --- Victim: create duress ------------------------------------------------
+    // ---------------- Victim: create duress ------------------
+
+    // ---------------- Victim: create duress (FORM-ENCODED) ------------------
+    // ---------------- Victim: create duress (JSON, as before) ------------------
+    // ---------------- Victim: create duress (JSON, as before) ------------------
     fun sendHelpRequest(
         currentUserZone: String,
-        mobile: String = "123456789",
+        mobile: String = "123456789", // or "1234567890" if you prefer
         onComplete: () -> Unit = {}
     ) {
         viewModelScope.launch(Dispatchers.IO) {
+            val tag = "DU/HTTP"
             try {
                 val url = URL("$baseUrl/help")
                 val conn = (url.openConnection() as HttpURLConnection).apply {
                     requestMethod = "POST"
                     setRequestProperty("Content-Type", "application/json")
+                    setRequestProperty("Accept", "application/json")
+                    connectTimeout = 10_000
+                    readTimeout = 10_000
                     doOutput = true
                 }
-                val payload = JSONObject().apply {
-                    // Server currently expects "name" & "zone" per your existing code
+
+                val json = JSONObject().apply {
                     put("name", _userName.value)
                     put("zone", currentUserZone)
                     put("mobile", mobile)
                 }
-                OutputStreamWriter(conn.outputStream).use { it.write(payload.toString()) }
+                Log.d(tag, "-> POST /help (json) $json")
+                OutputStreamWriter(conn.outputStream).use { it.write(json.toString()) }
 
-                if (conn.responseCode == HttpURLConnection.HTTP_OK) {
-                    val body = conn.inputStream.bufferedReader().use { it.readText() }
+                val code = conn.responseCode
+                val body = try {
+                    conn.inputStream.bufferedReader().use { it.readText() }
+                } catch (_: Throwable) {
+                    conn.errorStream?.bufferedReader()?.use { it.readText() } ?: ""
+                }
+                Log.d(tag, "<- $code /help body=${if (body.isBlank()) "<empty>" else body}")
+
+                if (code == HttpURLConnection.HTTP_OK) {
                     val js = JSONObject(body)
                     val room = js.optString("roomId").ifBlank { null }
-                    val bws = js.optString("broadcasterWs").ifBlank { null }
-                    val vws = js.optString("viewerWebsocketUrl").ifBlank { null }
+                    val bws  = js.optString("broadcasterWs").ifBlank { null }
+                    val vws  = js.optString("viewerWebsocketUrl").ifBlank { null }
 
                     withContext(Dispatchers.Main) {
                         _roomId.value = room
@@ -131,56 +151,80 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                         _isHelpSessionActive.value = true
                         _sessionStatus.value = "open"
                         _isSignalingReady.value = false
+
+                        // keep a local copy so victim can call /help_completed
+                        _requestingUser.value = HelpRequest(_userName.value, currentUserZone)
+
+                        Log.d("DU/HOME", "Help created roomId=$room bWS=$bws vWS=$vws")
                         onComplete()
                     }
                 } else {
-                    Log.e("DU/HTTP", "help: ${conn.responseCode} ${conn.responseMessage}")
+                    Log.e(tag, "help: $code ${conn.responseMessage}")
                 }
                 conn.disconnect()
-            } catch (t: Throwable) {
-                Log.w("DU/HTTP", "help failed: ${t.message}")
+            } catch (e: Exception) {
+                Log.w(tag, "help failed: ${e.message}", e)
             }
         }
     }
 
-    // --- Helper: poll for open requests --------------------------------------
-    fun checkForHelpRequest(currentUserName: String, currentUserZone: String? = null) {
+
+
+    // ---------------- Helper: poll for open requests ---------
+
+    // ---------------- Helper: poll for open requests (name/zone/mobile only) ---
+    fun checkForHelpRequest(currentUserName: String) {
         viewModelScope.launch(Dispatchers.IO) {
+            val tag = "DU/HTTP"
             try {
                 val url = URL("$baseUrl/listen")
                 val conn = (url.openConnection() as HttpURLConnection).apply {
                     requestMethod = "GET"
                     setRequestProperty("Accept", "application/json")
+                    connectTimeout = 10_000
+                    readTimeout = 10_000
                 }
 
-                if (conn.responseCode == HttpURLConnection.HTTP_OK) {
-                    val body = conn.inputStream.bufferedReader().use { it.readText() }
-                    val js = body.takeIf { it.isNotBlank() && it != "null" }?.let { JSONObject(it) }
+                val code = conn.responseCode
+                val body = try {
+                    conn.inputStream.bufferedReader().use { it.readText() }
+                } catch (_: Throwable) {
+                    conn.errorStream?.bufferedReader()?.use { it.readText() } ?: ""
+                }
+                Log.d(tag, "<- $code /listen body=${if (body.isBlank()) "<empty>" else body}")
 
-                    val statusValue = js?.optString("status") ?: "none"
-                    val victim = js?.optString("name").orEmpty()
-                    val zone = js?.optString("zone").orEmpty()
+                if (code == HttpURLConnection.HTTP_OK && body.isNotBlank() && body != "null") {
+                    val js = JSONObject(body)
+                    val victim = js.optString("name").orEmpty()
+                    val zone   = js.optString("zone").orEmpty()
+                    // mobile exists but not used in UI
 
                     withContext(Dispatchers.Main) {
-                        if (statusValue == "closed" ||  victim == currentUserName) {
-                            _helpRequest.value = null
-                        } else {
+                        if (victim.isNotBlank() && victim != currentUserName) {
                             _helpRequest.value = HelpRequest(victim, zone)
+                            Log.d("DU/HOME", "Incoming request from $victim in $zone")
+                        } else {
+                            _helpRequest.value = null
                         }
                     }
                 } else {
-                    Log.e("DU/HTTP", "listen: ${conn.responseCode} ${conn.responseMessage}")
+                    withContext(Dispatchers.Main) { _helpRequest.value = null }
                 }
                 conn.disconnect()
-            } catch (t: Throwable) {
-                Log.w("DU/HTTP", "listen failed: ${t.message}")
+            } catch (e: Exception) {
+                Log.w(tag, "listen failed: ${e.message}", e)
             }
         }
     }
 
-    // --- Helper: accept request (single-helper guarantee on server) -----------
+
+
+    // --------------- Helper: accept request -------------------
+
+    // --------------- Helper: accept request (form-encoded) ---------------------
     fun sendGiveHelpRequest(victimName: String, helper: String, onSuccess: () -> Unit) {
         viewModelScope.launch(Dispatchers.IO) {
+            val tag = "DU/HTTP"
             try {
                 val url = URL("$baseUrl/give_help")
                 val post = "name=${URLEncoder.encode(victimName, "UTF-8")}" +
@@ -189,32 +233,46 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                     requestMethod = "POST"
                     setRequestProperty("Content-Type", "application/x-www-form-urlencoded")
                     setRequestProperty("Accept", "application/json")
+                    connectTimeout = 10_000
+                    readTimeout = 10_000
                     doOutput = true
                 }
+                Log.d(tag, "-> POST /give_help body=$post")
                 conn.outputStream.use { it.write(post.toByteArray(Charsets.UTF_8)) }
 
-                if (conn.responseCode == HttpURLConnection.HTTP_OK) {
-                    val body = conn.inputStream.bufferedReader().use { it.readText() }
+                val code = conn.responseCode
+                val body = try {
+                    conn.inputStream.bufferedReader().use { it.readText() }
+                } catch (_: Throwable) {
+                    conn.errorStream?.bufferedReader()?.use { it.readText() } ?: ""
+                }
+                Log.d(tag, "<- $code /give_help body=${if (body.isBlank()) "<empty>" else body}")
+
+                if (code == HttpURLConnection.HTTP_OK) {
                     val js = JSONObject(body)
                     if (js.optString("status") == "success") {
                         withContext(Dispatchers.Main) { onSuccess() }
                     } else {
-                        Log.w("DU/HTTP", "give_help unexpected: $body")
+                        Log.w(tag, "give_help unexpected: $body")
                     }
                 } else {
-                    Log.e("DU/HTTP", "give_help: ${conn.responseCode} ${conn.responseMessage}")
+                    Log.e(tag, "give_help: $code ${conn.responseMessage}")
                 }
                 conn.disconnect()
-            } catch (t: Throwable) {
-                Log.w("DU/HTTP", "give_help failed: ${t.message}")
+            } catch (e: Exception) {
+                Log.w(tag, "give_help failed: ${e.message}", e)
             }
         }
     }
 
 
-    // --- Victim: wait for helper assignment -----------------------------------
+
+    // --------------- Victim: wait for helper assignment -------
+
+    // --------------- Victim: wait for helper assignment (form) -----------------
     fun listenForHelper(victimName: String) {
         viewModelScope.launch(Dispatchers.IO) {
+            val tag = "DU/HTTP"
             try {
                 val url = URL("$baseUrl/listen_for_helper")
                 val post = "name=${URLEncoder.encode(victimName, "UTF-8")}"
@@ -222,51 +280,60 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                     requestMethod = "POST"
                     setRequestProperty("Content-Type", "application/x-www-form-urlencoded")
                     setRequestProperty("Accept", "application/json")
+                    connectTimeout = 10_000
+                    readTimeout = 10_000
                     doOutput = true
                 }
+                Log.d(tag, "-> POST /listen_for_helper body=$post")
                 conn.outputStream.use { it.write(post.toByteArray(Charsets.UTF_8)) }
 
-                if (conn.responseCode == HttpURLConnection.HTTP_OK) {
-                    val body = conn.inputStream.bufferedReader().use { it.readText() }
-                    val js = body.takeIf { it.isNotBlank() && it != "null" }?.let { JSONObject(it) }
+                val code = conn.responseCode
+                val body = try {
+                    conn.inputStream.bufferedReader().use { it.readText() }
+                } catch (_: Throwable) {
+                    conn.errorStream?.bufferedReader()?.use { it.readText() } ?: ""
+                }
+                Log.d(tag, "<- $code /listen_for_helper body=${if (body.isBlank()) "<empty>" else body}")
 
-                    val helper = js?.optString("helper")?.ifBlank { null }
-                    val statusValue = js?.optString("status") // may be null
+                if (code == HttpURLConnection.HTTP_OK && body.isNotBlank() && body != "null") {
+                    val js = JSONObject(body)
+                    val helper = js.optString("helper").orEmpty()
+                    val statusValue = js.optString("status").orEmpty()
 
                     withContext(Dispatchers.Main) {
-                        if (statusValue == "closed") {
+                        if (helper.isNotBlank() && statusValue.equals("open", ignoreCase = true)) {
+                            _helperName.value = helper
+                            _isHelpSessionActive.value = true
+                            _isSignalingReady.value = true
+                            _sessionStatus.value = "open"
+                            Log.d(tag, "listen_for_helper → helper=$helper, status=$statusValue")
+                        } else if (statusValue.equals("closed", ignoreCase = true) && helper.isBlank()) {
+                            // Only close if no helper is present
                             _helperName.value = null
                             _sessionStatus.value = "closed"
                             _isHelpSessionActive.value = false
                             _isSignalingReady.value = false
-                            Log.d("DU/HTTP", "listen_for_helper → closed")
+                            Log.d(tag, "listen_for_helper → closed (no helper)")
                         } else {
-                            if (!helper.isNullOrBlank()) {
-                                _helperName.value = helper
-                                _isHelpSessionActive.value = true
-                                _sessionStatus.value = statusValue ?: "open"
-                                _isSignalingReady.value = true
-                                Log.d("DU/HTTP", "listen_for_helper → helper=$helper, status=${statusValue ?: "open"}")
-                            } else {
-                                Log.d("DU/HTTP", "listen_for_helper → no change")
-                            }
+                            Log.d(tag, "listen_for_helper → no change (helper='$helper', status='$statusValue')")
                         }
                     }
-                } else {
-                    Log.e("DU/HTTP", "listen_for_helper: ${conn.responseCode} ${conn.responseMessage}")
                 }
                 conn.disconnect()
-            } catch (t: Throwable) {
-                Log.w("DU/HTTP", "listen_for_helper failed: ${t.message}")
+            } catch (e: Exception) {
+                Log.w(tag, "listen_for_helper failed: ${e.message}", e)
             }
         }
     }
 
 
 
-    // --- Either role: finish session ------------------------------------------
+    // ---------------- Either role: finish session --------------
+
+    // ---------------- Either role: finish session (form) ------------------------
     fun sendHelpCompleted(victimName: String, helper: String, onSuccess: () -> Unit) {
         viewModelScope.launch(Dispatchers.IO) {
+            val tag = "DU/HTTP"
             try {
                 val url = URL("$baseUrl/help_completed")
                 val post = "name=${URLEncoder.encode(victimName, "UTF-8")}" +
@@ -275,31 +342,41 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                     requestMethod = "POST"
                     setRequestProperty("Content-Type", "application/x-www-form-urlencoded")
                     setRequestProperty("Accept", "application/json")
+                    connectTimeout = 10_000
+                    readTimeout = 10_000
                     doOutput = true
                 }
+                Log.d(tag, "-> POST /help_completed body=$post")
                 conn.outputStream.use { it.write(post.toByteArray(Charsets.UTF_8)) }
 
-                if (conn.responseCode == HttpURLConnection.HTTP_OK) {
-                    val body = conn.inputStream.bufferedReader().use { it.readText() }
+                val code = conn.responseCode
+                val body = try {
+                    conn.inputStream.bufferedReader().use { it.readText() }
+                } catch (_: Throwable) {
+                    conn.errorStream?.bufferedReader()?.use { it.readText() } ?: ""
+                }
+                Log.d(tag, "<- $code /help_completed body=${if (body.isBlank()) "<empty>" else body}")
+
+                if (code == HttpURLConnection.HTTP_OK) {
                     val js = JSONObject(body)
                     if (js.optString("status") == "success") {
                         withContext(Dispatchers.Main) { onSuccess(); teardownSessionState() }
                     } else {
-                        Log.w("DU/HTTP", "help_completed unexpected: $body")
+                        Log.w(tag, "help_completed unexpected: $body")
                     }
                 } else {
-                    Log.e("DU/HTTP", "help_completed: ${conn.responseCode} ${conn.responseMessage}")
+                    Log.e(tag, "help_completed: $code ${conn.responseMessage}")
                 }
                 conn.disconnect()
-            } catch (t: Throwable) {
-                Log.w("DU/HTTP", "help_completed failed: ${t.message}")
+            } catch (e: Exception) {
+                Log.w(tag, "help_completed failed: ${e.message}", e)
             }
         }
     }
 
 
-    // --- Streaming control (both roles) ---------------------------------------
-    // MainViewModel.kt (replace your startStreaming with this version)
+    // ---------------- Streaming control (both roles) -----------
+
     fun startStreaming(
         wsUrl: String?,              // may be null; we’ll pick from state
         roomId: String,
@@ -312,8 +389,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         _role.value = role
 
         viewModelScope.launch(Dispatchers.Default) {
+            val tag = "DU/RTC"
             try {
-                // pick the correct websocket from args or state (populated by /help)
                 val socketUrl = wsUrl
                     ?: when (role) {
                         StreamRole.VICTIM -> _broadcasterWs.value
@@ -321,7 +398,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                     }
                     ?: throw IllegalStateException("No websocket URL for role=$role (room=$roomId)")
 
-                Log.d("DU/RTC", "startStreaming → role=$role room=$roomId ws=$socketUrl")
+                Log.d(tag, "startStreaming → role=$role room=$roomId ws=$socketUrl")
 
                 cameraProvider.startStream(
                     wsUrl = socketUrl,
@@ -334,9 +411,10 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 withContext(Dispatchers.Main) {
                     _streamingState.value = StreamingState.Streaming
                     _isSignalingReady.value = true
+                    Log.d(tag, "Streaming=ON role=$role")
                 }
             } catch (t: Throwable) {
-                Log.w("DU/RTC", "startStreaming error: ${t.message}", t)
+                Log.w(tag, "startStreaming error: ${t.message}", t)
                 withContext(Dispatchers.Main) {
                     _streamError.value = t.message
                     _streamingState.value = StreamingState.Idle
@@ -345,13 +423,14 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-
     fun stopStreaming() {
         viewModelScope.launch(Dispatchers.Default) {
+            val tag = "DU/RTC"
             try {
                 cameraProvider.stopStream()
+                Log.d(tag, "Streaming=OFF")
             } catch (t: Throwable) {
-                Log.w("DU/RTC", "stopStream error: ${t.message}")
+                Log.w(tag, "stopStream error: ${t.message}")
             } finally {
                 withContext(Dispatchers.Main) { _streamingState.value = StreamingState.Idle }
             }
@@ -360,7 +439,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     fun isStreaming(): Boolean = cameraProvider.isStreamActive()
 
-    // --- Helpers ---------------------------------------------------------------
+    // ---------------- Helpers ---------------------------------
+
     private fun teardownSessionState() {
         _roomId.value = null
         _broadcasterWs.value = null
@@ -372,6 +452,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         _sessionStatus.value = "closed"
         _helperName.value = null
         _requestingUser.value = null
+        Log.d("DU/HOME", "Session teardown complete")
     }
 
     fun clearHelpRequest() { _helpRequest.value = null }

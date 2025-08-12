@@ -34,7 +34,7 @@ fun HomeScreen(
 ) {
     val context = LocalContext.current
 
-    // ---------- VM state (all are values, not flows) ----------
+    // ---------- VM state (Flows -> Compose) ----------
     val helpRequest by viewModel.helpRequest.collectAsState()
     val helperName by viewModel.helperName.collectAsState()
     val status by viewModel.sessionStatus.collectAsState()             // "open" | "taken" | "closed"
@@ -119,10 +119,14 @@ fun HomeScreen(
         }
     }
 
-    // Session closed → cleanup
+    // Session status change → cleanup if closed
     LaunchedEffect(status) {
         if (status == "closed") {
             Log.d(TAG, "Status=closed → cleanup")
+            // NEW: hide any open dialog and clear request so it can't re-open
+            dialogVisible = false                  // NEW
+            viewModel.clearHelpRequest()           // NEW
+
             pollingSupervisor.cancelChildren()
             startPolling = false
             viewModel.stopStreaming()
@@ -134,6 +138,7 @@ fun HomeScreen(
         }
     }
 
+
     // Dispose: stop stream if screen leaves
     DisposableEffect(Unit) {
         onDispose {
@@ -141,6 +146,24 @@ fun HomeScreen(
             viewModel.stopStreaming()
         }
     }
+
+    LaunchedEffect(isSignalingReady, roomId, broadcasterWs, streamingState) {
+        if (isSignalingReady &&
+            streamingState == StreamingState.Idle &&
+            !broadcasterWs.isNullOrBlank() &&
+            !roomId.isNullOrBlank()
+        ) {
+            Log.d("DU/HOME", "Auto-start victim stream: ws=$broadcasterWs room=$roomId")
+            viewModel.startStreaming(
+                wsUrl = broadcasterWs!!,
+                roomId = roomId!!,
+                role = CameraServiceProvider.StreamRole.VICTIM
+            ) { /* Victim ignores remote */ }
+            // If your CameraView depends on a local flag, flip it here:
+            // isCameraOn.value = true
+        }
+    }
+
 
     // Victim: poll for helper assignment while waiting
     LaunchedEffect(startPolling) {
@@ -160,18 +183,22 @@ fun HomeScreen(
         }
     }
 
-    // Helper: when Give Help is pressed, auto start HELPER stream
+    // Helper: when Give Help is pressed, auto start HELPER stream (if we know roomId + viewerWs)
     LaunchedEffect(giveHelpBtnPressed, viewerWs, roomId) {
-        if (giveHelpBtnPressed && !viewerWs.isNullOrBlank() && !roomId.isNullOrBlank()) {
-            Log.d(TAG, "Helper join: viewerWs=$viewerWs roomId=$roomId state=$streamingState")
-            if (streamingState == StreamingState.Idle) {
-                viewModel.startStreaming(
-                    wsUrl = viewerWs!!,
-                    roomId = roomId!!,
-                    role = CameraServiceProvider.StreamRole.HELPER
-                ) { track: VideoTrack ->
-                    Log.d(TAG, "Helper received remote track")
-                    viewModel.setIncomingVideoTrack(track)
+        if (giveHelpBtnPressed) {
+            if (viewerWs.isNullOrBlank() || roomId.isNullOrBlank()) {
+                Log.w(TAG, "Helper join pending: viewerWs/roomId missing (viewerWs=$viewerWs, roomId=$roomId)")
+            } else {
+                Log.d(TAG, "Helper join: viewerWs=$viewerWs roomId=$roomId state=$streamingState")
+                if (streamingState == StreamingState.Idle) {
+                    viewModel.startStreaming(
+                        wsUrl = viewerWs!!,
+                        roomId = roomId!!,
+                        role = CameraServiceProvider.StreamRole.HELPER
+                    ) { track: VideoTrack ->
+                        Log.d(TAG, "Helper received remote track")
+                        viewModel.setIncomingVideoTrack(track)
+                    }
                 }
             }
         }
@@ -304,15 +331,14 @@ fun HomeScreen(
                                         isCameraOn.value = true
                                     }
                                 } else {
-                                    Log.d(TAG, "Finish pressed → help_completed")
-                                    viewModel.requestingUser?.let { user ->
-                                        viewModel.sendHelpCompleted(
-                                            victimName = user.name,
-                                            helper = userName
-                                        ) {
-                                            giveHelpBtnPressed = false
-                                            isCameraOn.value = false
-                                        }
+                                    Log.d(TAG, "Finish pressed → help_completed (victimName=$userName, helper=${helperName ?: ""})")
+                                    // Victim can always finish with their own name; helper may be empty if not yet assigned
+                                    viewModel.sendHelpCompleted(
+                                        victimName = userName,
+                                        helper = helperName ?: ""
+                                    ) {
+                                        giveHelpBtnPressed = false
+                                        isCameraOn.value = false
                                     }
                                 }
                             },
@@ -330,13 +356,17 @@ fun HomeScreen(
 
     // ---------------- Incoming Help Request Dialog (Helper) --------------------
     helpRequest?.let {
-        if (it.name != userName && !dialogVisible) dialogVisible = true
-        if (dialogVisible) {
+        // Only show if it's not me AND I haven't already accepted someone
+        val shouldShow = (it.name != userName) && !giveHelpBtnPressed
+        if (shouldShow && !dialogVisible) dialogVisible = true
+        if (!shouldShow && dialogVisible) dialogVisible = false
+
+        if (dialogVisible && shouldShow) {
             AlertDialog(
                 onDismissRequest = {
                     Log.d(TAG, "Help dialog dismissed")
                     dialogVisible = false
-                    viewModel.clearHelpRequest()
+                    viewModel.clearHelpRequest() // prevent immediate re-open on next poll
                 },
                 title = { Text("${it.name} needs help!") },
                 text = { Text("${it.name} in ${it.zone} needs assistance.") },
@@ -348,6 +378,7 @@ fun HomeScreen(
                         giveHelpBtnPressed = true
                         isDuressDetected.value = true
                         dialogVisible = false
+                        viewModel.clearHelpRequest() // <- key
                     }) { Text("Give Help") }
                 },
                 dismissButton = {
@@ -360,4 +391,5 @@ fun HomeScreen(
             )
         }
     }
+
 }

@@ -21,6 +21,9 @@ class CameraServiceProvider {
     @Volatile private var role: StreamRole = StreamRole.VICTIM
     @Volatile private var roomId: String? = null
 
+    // Keep a safe app context for starting capture once WS opens
+    @Volatile private var appContext: Context? = null
+
     private var signalingSocket: SignalingSocket? = null
     private var webRTCClient: WebRTCClient? = null
 
@@ -34,8 +37,8 @@ class CameraServiceProvider {
 
     /**
      * Start signaling/RTC for the given role.
-     * Victim: starts local capture, creates OFFER, sends to server.
-     * Helper: waits for OFFER, sets remote, creates ANSWER, sends to server (no local capture).
+     * Victim: waits for WS open → starts local capture → auto creates/sends OFFER.
+     * Helper: waits for OFFER → sets remote → creates/sends ANSWER (no local capture).
      */
     @MainThread
     fun startStream(
@@ -53,12 +56,13 @@ class CameraServiceProvider {
         this.role = role
         this.roomId = roomId
         this.remoteVideoCallback = onRemoteVideo
+        this.appContext = context.applicationContext
 
         Log.d(TAG_LIFE, "Starting stream role=$role room=$roomId")
         Log.d(TAG_WS, "WS URL: $wsUrl")
 
         // Prepare RTC first so WS callbacks can use it immediately.
-        webRTCClient = createRtcClient(context)
+        webRTCClient = createRtcClient(this.appContext!!)
 
         signalingSocket = SignalingSocket(wsUrl, createSocketListener()).also {
             Log.d(TAG_WS, "Connecting WS…")
@@ -87,10 +91,13 @@ class CameraServiceProvider {
 
         roomId = null
         remoteVideoCallback = null
+        appContext = null
+
         Log.d(TAG_LIFE, "Stream resources released")
     }
 
-    fun isStreamActive(): Boolean = started.get() && signalingSocket != null && webRTCClient != null
+    fun isStreamActive(): Boolean =
+        started.get() && signalingSocket != null && webRTCClient != null
 
     /** Victim-only: UI passes its SurfaceViewRenderer via VM → provider. */
     fun setLocalPreviewSink(sink: org.webrtc.VideoSink?) {
@@ -118,7 +125,7 @@ class CameraServiceProvider {
             override fun onIceCandidateFound(candidate: IceCandidate) {
                 val rid = roomId ?: return
                 Log.d(TAG_ICE, "Local ICE → send room=$rid")
-                // Your SignalingSocket takes only the SDP string + roomId (no mid/index).
+                // Your signaling uses raw candidate string only
                 signalingSocket?.sendCandidate(candidate.sdp, rid)
             }
 
@@ -132,8 +139,9 @@ class CameraServiceProvider {
         client.initialize(answerMode = (role == StreamRole.HELPER))
 
         if (role == StreamRole.VICTIM) {
-            Log.d(TAG_RTC, "Victim: start local camera")
-            client.startLocalVideo(appContext)
+            // IMPORTANT: Do not start local capture yet.
+            // We’ll start it in onSocketOpened() to ensure WS is ready before the OFFER is sent.
+            Log.d(TAG_RTC, "Victim: will start local camera AFTER WS opens")
         } else {
             Log.d(TAG_RTC, "Helper: no local capture")
         }
@@ -147,7 +155,20 @@ class CameraServiceProvider {
         @WorkerThread
         override fun onSocketOpened() {
             Log.d(TAG_WS, "WS opened role=$role room=$roomId")
-            // Victim will createOffer after local video starts; Helper waits for Offer.
+            if (role == StreamRole.VICTIM) {
+                // Start capture now; WebRTCClient will createOffer() right away
+                val ctx = appContext
+                if (ctx == null) {
+                    Log.w(TAG_RTC, "App context is null; cannot start local video")
+                    return
+                }
+                try {
+                    webRTCClient?.startLocalVideo(ctx)
+                    Log.d(TAG_RTC, "Local capture started after WS open (will trigger OFFER)")
+                } catch (t: Throwable) {
+                    Log.w(TAG_RTC, "Failed to start local video after WS open: ${t.message}")
+                }
+            }
         }
 
         @WorkerThread
