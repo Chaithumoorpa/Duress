@@ -49,6 +49,8 @@ class WebRTCClient(
             .createPeerConnectionFactory()
     }
 
+    fun getEglBase(): EglBase = eglBase
+
     fun initialize(answerMode: Boolean = false) {
         CoroutineScope(Dispatchers.Default).launch {
             val iceServers = listOf(
@@ -136,6 +138,7 @@ class WebRTCClient(
 
     fun startLocalVideo(context: Context) {
         localVideoSource = peerConnectionFactory.createVideoSource(false)
+        localVideoSource?.adaptOutputFormat(640, 360, 15)
 
         surfaceTextureHelper = SurfaceTextureHelper.create("CaptureThread", eglBase.eglBaseContext)
         try {
@@ -146,13 +149,17 @@ class WebRTCClient(
         }
 
         videoCapturer?.initialize(surfaceTextureHelper, context, localVideoSource?.capturerObserver)
-        videoCapturer?.startCapture(1280, 720, 15)
+        videoCapturer?.startCapture(640, 360, 15)
 
         localVideoTrack = peerConnectionFactory.createVideoTrack("video_track", localVideoSource)
         localVideoTrack?.setEnabled(true)
 
         peerConnection?.addTrack(localVideoTrack)
         Log.d("WebRTCClient", "Local video track started")
+    }
+
+    fun registerLocalRenderer(renderer: VideoSink) {
+        localVideoTrack?.addSink(renderer)
     }
 
     fun stopLocalVideo() {
