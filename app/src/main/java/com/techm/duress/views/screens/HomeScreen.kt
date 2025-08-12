@@ -83,7 +83,8 @@ fun HomeScreen(
 
     // BLE zone detection
     LaunchedEffect(Unit) {
-        bleData.value = BleProvider.loadBLE(context)
+        withContext (Dispatchers.IO){ bleData.value = BleProvider.loadBLE(context)  }
+
     }
 
     LaunchedEffect(isDuressDetected.value) {
@@ -122,23 +123,6 @@ fun HomeScreen(
     }
 
 
-    LaunchedEffect(startPolling) {
-        pollingSupervisor.cancelChildren() // Cancel any previous polling
-        if (startPolling) {
-            pollingScope.launch {
-                while (isActive) {
-                    try {
-                        withTimeoutOrNull(5000) {
-                            viewModel.listenForHelper(userName)
-                        }
-                        delay(10000)
-                    } catch (e: Exception) {
-                        Log.e("HomeScreen", "Polling error: ${e.message}", e)
-                    }
-                }
-            }
-        }
-    }
 
     LaunchedEffect(status) {
         if (status == "closed") {
@@ -289,10 +273,6 @@ fun HomeScreen(
                         )
                     }
 
-                    if (giveHelpBtnPressed) {
-                        SpeakView(modifier = Modifier.fillMaxWidth(), requestingUser?.name)
-                    }
-
                     Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                         DuressView(
                             modifier = Modifier.weight(1f),
@@ -325,6 +305,24 @@ fun HomeScreen(
                         if (giveHelpBtnPressed) {
                             CallView(modifier = Modifier.weight(1f))
                         }
+                    }
+                }
+            }
+        }
+    }
+
+    LaunchedEffect(startPolling) {
+        pollingSupervisor.cancelChildren() // Cancel any previous polling
+        if (startPolling) {
+            pollingScope.launch {
+                while (isActive) {
+                    try {
+                        withTimeoutOrNull(5000) {
+                            viewModel.listenForHelper(userName)
+                        }
+                        delay(10000)
+                    } catch (e: Exception) {
+                        Log.e("HomeScreen", "Polling error: ${e.message}", e)
                     }
                 }
             }

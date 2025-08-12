@@ -101,3 +101,4 @@ fun DistanceMeterSection(distanceInMeters: Float, gettingCloser: Boolean) {
         Text("Distance: %.2f meters".format(distanceInMeters))
     }
 }
+

@@ -36,7 +36,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
 
     // IMPORTANT: Replace with your Go server's IP address and port
-    var baseUrl: String = "http://192.168.1.15:8080/duress"
+    var baseUrl: String = "http://10.246.34.245:8080/duress"
 
     var userName: String = ""
         private set

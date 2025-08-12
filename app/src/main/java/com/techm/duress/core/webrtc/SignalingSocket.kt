@@ -55,7 +55,7 @@ class SignalingSocket(
                     when (event) {
                         "offer" -> signalingListener.onOfferReceived(data)
                         "answer" -> signalingListener.onAnswerReceived(data)
-                        "ice-candidate" -> signalingListener.onIceCandidateReceived(data)
+                        "candidate" -> signalingListener.onIceCandidateReceived(data)
                         else -> Log.w("SignalingSocket", "Unknown event: $event")
                     }
                 } catch (e: Exception) {
@@ -142,7 +142,7 @@ class SignalingSocket(
     fun sendCandidate(candidate: String, roomId: String) {
         try {
             val json = JSONObject().apply {
-                put("event", "ice-candidate")
+                put("event", "candidate")
                 put("data", candidate)
                 put("roomId", roomId)
             }

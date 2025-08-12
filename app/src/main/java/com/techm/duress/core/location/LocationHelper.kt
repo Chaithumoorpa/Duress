@@ -104,3 +104,4 @@ fun fetchFriendLocationAndUpdateDistance(myLocation: Location, onDistanceCalcula
 //        }
     }
 }
+

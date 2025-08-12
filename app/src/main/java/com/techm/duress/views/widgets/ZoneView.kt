@@ -67,3 +67,4 @@ fun ZoneView(isDuressDetected: Boolean,context:Context) {
         }
     }
 }
+
