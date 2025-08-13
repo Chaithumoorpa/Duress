@@ -3,7 +3,7 @@ package com.techm.duress.core.zone
 import android.util.Log
 import androidx.compose.runtime.State
 import androidx.compose.runtime.mutableStateOf
-import com.techm.duress.models.BLEModel
+import com.techm.duress.model.BLEModel
 import kotlin.math.abs
 
 /**

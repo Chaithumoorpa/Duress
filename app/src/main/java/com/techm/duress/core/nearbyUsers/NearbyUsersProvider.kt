@@ -2,7 +2,7 @@ package com.techm.duress.core.nearbyUsers
 
 import android.content.Context
 import android.util.Log
-import com.techm.duress.models.UserModel
+import com.techm.duress.model.UserModel
 import org.json.JSONArray
 import org.json.JSONException
 import org.json.JSONObject

@@ -1,4 +1,4 @@
-package com.techm.duress.models
+package com.techm.duress.model
 
 import androidx.compose.ui.geometry.Offset
 

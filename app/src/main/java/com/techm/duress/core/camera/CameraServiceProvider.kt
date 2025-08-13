@@ -7,8 +7,10 @@ import androidx.annotation.MainThread
 import androidx.annotation.WorkerThread
 import com.techm.duress.core.webrtc.SignalingSocket
 import com.techm.duress.core.webrtc.WebRTCClient
+import org.json.JSONObject
 import org.webrtc.IceCandidate
 import org.webrtc.SessionDescription
+import org.webrtc.VideoSink
 import org.webrtc.VideoTrack
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -26,6 +28,8 @@ class CameraServiceProvider {
     private var webRTCClient: WebRTCClient? = null
 
     private var remoteVideoCallback: ((VideoTrack) -> Unit)? = null
+    private var localPreviewSink: VideoSink? = null
+    private var localVideoTrack: VideoTrack? = null
 
     private val TAG_WS = "DU/WS"
     private val TAG_SDP = "DU/SDP"
@@ -33,6 +37,7 @@ class CameraServiceProvider {
     private val TAG_RTC = "DU/RTC"
     private val TAG_LIFE = "DU/LIFECYCLE"
 
+    /** Public API **/
     @MainThread
     fun startStream(
         wsUrl: String,
@@ -42,7 +47,7 @@ class CameraServiceProvider {
         onRemoteVideo: (VideoTrack) -> Unit
     ) {
         if (!started.compareAndSet(false, true)) {
-            Log.d(TAG_LIFE, "startStream ignored; already started")
+            Log.d(TAG_LIFE, "startStream ignored; already active")
             return
         }
 
@@ -51,38 +56,35 @@ class CameraServiceProvider {
         this.remoteVideoCallback = onRemoteVideo
         this.appContext = context.applicationContext
 
-        Log.d(TAG_LIFE, "Starting stream role=$role room=$roomId")
+        Log.d(TAG_LIFE, "Starting stream → role=$role room=$roomId")
         Log.d(TAG_WS, "WS URL: $wsUrl")
 
-        // Prepare RTC BEFORE opening WS
-        webRTCClient = createRtcClient(this.appContext!!)
-
-        signalingSocket = SignalingSocket(wsUrl, createSocketListener()).also {
-            Log.d(TAG_WS, "Connecting WS…")
-            it.connect()
+        // Create WebRTC client & connect WebSocket
+        webRTCClient = createRtcClient(appContext!!)
+        signalingSocket = SignalingSocket(wsUrl, createSocketListener()).apply {
+            Log.d(TAG_WS, "Connecting WebSocket…")
+            connect()
         }
     }
 
     @MainThread
     fun stopStream() {
         if (!started.compareAndSet(true, false)) {
-            Log.d(TAG_LIFE, "stopStream ignored; not started")
+            Log.d(TAG_LIFE, "stopStream ignored; not active")
             return
         }
-
         val rid = roomId
-        Log.d(TAG_LIFE, "Stopping stream role=$role room=$rid")
+        Log.d(TAG_LIFE, "Stopping stream → role=$role room=$rid")
 
-        try { signalingSocket?.disconnect() } catch (t: Throwable) {
-            Log.w(TAG_WS, "WS disconnect error: ${t.message}")
-        } finally { signalingSocket = null }
+        signalingSocket?.runCatching { disconnect() }
+        webRTCClient?.runCatching { release() }
 
-        try { webRTCClient?.release() } catch (t: Throwable) {
-            Log.w(TAG_RTC, "WebRTC release error: ${t.message}")
-        } finally { webRTCClient = null }
-
+        signalingSocket = null
+        webRTCClient = null
         roomId = null
         remoteVideoCallback = null
+        localPreviewSink = null
+        localVideoTrack = null
         appContext = null
 
         Log.d(TAG_LIFE, "Stream resources released")
@@ -91,45 +93,59 @@ class CameraServiceProvider {
     fun isStreamActive(): Boolean =
         started.get() && signalingSocket != null && webRTCClient != null
 
-    fun setLocalPreviewSink(sink: org.webrtc.VideoSink?) {
-        webRTCClient?.setLocalPreviewSink(sink)
+    /**
+     * Victim self-preview setup — can be called anytime before or after local track creation.
+     */
+    fun setLocalPreviewSink(sink: VideoSink?) {
+        localPreviewSink = sink
+        localVideoTrack?.let { track ->
+            runCatching { sink?.let { track.addSink(it) } }
+        }
     }
 
+    /** Internal helpers **/
     private fun createRtcClient(appContext: Context): WebRTCClient {
         val t0 = SystemClock.elapsedRealtime()
         Log.d(TAG_RTC, "Init WebRTCClient role=$role")
 
         val client = WebRTCClient(appContext, object : WebRTCClient.SignalingCallback {
+
             override fun onLocalSDPGenerated(sdp: SessionDescription) {
                 val rid = roomId ?: return
-                // IMPORTANT: with SFU, both roles ANSWER the server
-                Log.d(TAG_SDP, "Local ${sdp.type} → send ANSWER room=$rid")
-                signalingSocket?.sendAnswer(sdp.description, rid)
+                if (role == StreamRole.VICTIM) {
+                    Log.d(TAG_SDP, "Local OFFER → send to room=$rid")
+                    signalingSocket?.sendOffer(sdp.description, rid)
+                } else {
+                    Log.d(TAG_SDP, "Local ANSWER → send to room=$rid")
+                    signalingSocket?.sendAnswer(sdp.description, rid)
+                }
             }
 
             override fun onIceCandidateFound(candidate: IceCandidate) {
                 val rid = roomId ?: return
-                Log.d(TAG_ICE, "Local ICE → send room=$rid (mid=${candidate.sdpMid}, idx=${candidate.sdpMLineIndex})")
-                signalingSocket?.sendCandidate(candidate.sdpMid, candidate.sdpMLineIndex, candidate.sdp, rid)
+                val payload = JSONObject()
+                    .put("candidate", candidate.sdp)
+                    .put("sdpMid", candidate.sdpMid)
+                    .put("sdpMLineIndex", candidate.sdpMLineIndex)
+                Log.d(TAG_ICE, "Local ICE → send (mid=${candidate.sdpMid}, idx=${candidate.sdpMLineIndex})")
+                signalingSocket?.sendCandidate(payload.toString(), rid)
             }
 
             override fun onRemoteVideoTrackReceived(track: VideoTrack) {
-                Log.d(TAG_RTC, "Remote track received → UI")
+                Log.d(TAG_RTC, "Remote track received → dispatch to UI")
                 remoteVideoCallback?.invoke(track)
+            }
+
+            override fun onLocalVideoTrackCreated(track: VideoTrack) {
+                Log.d(TAG_RTC, "Local video track created — attaching preview sink")
+                localVideoTrack = track
+                localPreviewSink?.let { sink ->
+                    runCatching { track.addSink(sink) }
+                }
             }
         })
 
-        // With an SFU the server sends offers to everyone; clients answer.
-        // Victim must SEND video, Helper RECV video.
-        val sendVideo = (role == StreamRole.VICTIM)
-        client.initialize(sendVideo = sendVideo, isAnswerer = true)
-
-        if (sendVideo) {
-            Log.d(TAG_RTC, "Victim: will start local camera AFTER WS opens")
-        } else {
-            Log.d(TAG_RTC, "Helper: view-only (no local capture)")
-        }
-
+        client.initialize(answerMode = (role == StreamRole.HELPER))
         Log.d(TAG_RTC, "WebRTC ready in ${SystemClock.elapsedRealtime() - t0}ms")
         return client
     }
@@ -138,57 +154,61 @@ class CameraServiceProvider {
 
         @WorkerThread
         override fun onSocketOpened() {
-            Log.d(TAG_WS, "WS opened role=$role room=$roomId")
+            Log.d(TAG_WS, "WebSocket opened → role=$role room=$roomId")
             if (role == StreamRole.VICTIM) {
-                val ctx = appContext ?: run {
-                    Log.w(TAG_RTC, "App context is null; cannot start local video")
-                    return
-                }
-                try {
-                    Log.d(TAG_RTC, "WS OPEN → startLocalVideo() (wait for server OFFER)")
-                    webRTCClient?.startLocalVideo(ctx) // bind local track; DO NOT create offer
-                } catch (t: Throwable) {
-                    Log.w(TAG_RTC, "Failed to start local video after WS open: ${t.message}")
-                }
+                appContext?.let { ctx ->
+                    runCatching {
+                        Log.d(TAG_RTC, "Starting local camera (Victim) + sending OFFER")
+                        webRTCClient?.startLocalVideo(ctx)
+                    }.onFailure {
+                        Log.w(TAG_RTC, "Failed to start local video: ${it.message}")
+                    }
+                } ?: Log.w(TAG_RTC, "App context null; cannot start local video")
             }
         }
 
         @WorkerThread
         override fun onOfferReceived(sdp: String) {
-            Log.d(TAG_SDP, "Offer received (len=${sdp.length}) role=$role")
-            try { webRTCClient?.setRemoteSDP(sdp) }  // will create/send ANSWER
-            catch (t: Throwable) { Log.w(TAG_SDP, "setRemoteSDP(offer) failed: ${t.message}") }
+            Log.d(TAG_SDP, "Offer received → role=$role")
+            runCatching {
+                webRTCClient?.setRemoteSDP(sdp)
+                if (role == StreamRole.HELPER) {
+                    Log.d(TAG_SDP, "Creating ANSWER in response to offer…")
+                    webRTCClient?.createAnswer()
+                }
+            }.onFailure {
+                Log.w(TAG_SDP, "Failed to set remote SDP (offer): ${it.message}")
+            }
         }
 
         @WorkerThread
         override fun onAnswerReceived(sdp: String) {
-            Log.d(TAG_SDP, "Answer received (len=${sdp.length}) role=$role")
-            try { webRTCClient?.setRemoteSDP(sdp) }  // not typical with SFU, but keep
-            catch (t: Throwable) { Log.w(TAG_SDP, "setRemoteSDP(answer) failed: ${t.message}") }
+            Log.d(TAG_SDP, "Answer received → role=$role")
+            runCatching { webRTCClient?.setRemoteSDP(sdp) }
+                .onFailure { Log.w(TAG_SDP, "Failed to set remote SDP (answer): ${it.message}") }
         }
 
         @WorkerThread
         override fun onIceCandidateReceived(candidatePayload: String) {
-            Log.d(TAG_ICE, "Remote ICE received")
-            try {
-                val js = try { org.json.JSONObject(candidatePayload) } catch (_: Throwable) { null }
-                if (js != null && js.has("candidate")) {
-                    val cand = js.optString("candidate")
+            Log.d(TAG_ICE, "Remote ICE candidate received")
+            runCatching {
+                val js = runCatching { JSONObject(candidatePayload) }.getOrNull()
+                if (js?.has("candidate") == true) {
+                    val cand = js.getString("candidate")
                     val mid = js.optString("sdpMid", null)
-                    val mline = if (js.has("sdpMLineIndex")) js.optInt("sdpMLineIndex", 0) else 0
+                    val mline = js.optInt("sdpMLineIndex", 0)
                     webRTCClient?.addRemoteIceCandidate(mid, mline, cand)
                 } else {
-                    // Legacy: plain string
                     webRTCClient?.addRemoteIceCandidate(candidatePayload)
                 }
-            } catch (t: Throwable) {
-                Log.w(TAG_ICE, "addRemoteIceCandidate failed: ${t.message}")
+            }.onFailure {
+                Log.w(TAG_ICE, "Failed to add remote ICE: ${it.message}")
             }
         }
 
         @WorkerThread
         override fun onSocketClosed() {
-            Log.d(TAG_WS, "WS closed role=$role room=$roomId")
+            Log.d(TAG_WS, "WebSocket closed → role=$role room=$roomId")
         }
     }
 }

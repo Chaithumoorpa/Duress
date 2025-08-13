@@ -11,7 +11,7 @@ import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.nativeCanvas
 import com.techm.duress.core.zone.ZoneDetector
 import com.techm.duress.core.zone.ZoneProvider
-import com.techm.duress.models.ZoneModel
+import com.techm.duress.model.ZoneModel
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 

@@ -13,7 +13,7 @@ import androidx.compose.ui.unit.dp
 import com.techm.duress.core.nearbyUsers.NearbyUsersProvider
 import com.techm.duress.core.zone.ZoneDetector
 import com.techm.duress.core.zone.ZoneProvider
-import com.techm.duress.models.UserModel
+import com.techm.duress.model.UserModel
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext

@@ -7,6 +7,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.techm.duress.core.camera.CameraServiceProvider
 import com.techm.duress.core.camera.CameraServiceProvider.StreamRole
+import com.techm.duress.core.webrtc.WebRTCClient
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -81,8 +82,14 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     // --- RTC encapsulated in provider ----------------------------------------
     private val cameraProvider = CameraServiceProvider()
 
+    private var webrtcClient: WebRTCClient? = null
+
     fun attachLocalRenderer(renderer: SurfaceViewRenderer?) {
-        cameraProvider.setLocalPreviewSink(renderer)
+        try {
+            webrtcClient?.setLocalPreviewSink(renderer)
+        } catch (e: Exception) {
+            Log.e("DU/VM", "Error attaching local renderer: ${e.message}", e)
+        }
     }
 
     fun setIncomingVideoTrack(track: VideoTrack) {
@@ -381,7 +388,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     // ---------------- Streaming control (both roles) --------------------------
     fun startStreaming(
-        wsUrl: String?,              // may be null; we’ll pick from state
+        wsUrl: String?,
         roomId: String,
         role: StreamRole,
         onRemoteVideo: (VideoTrack) -> Unit
@@ -394,30 +401,30 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch(Dispatchers.Default) {
             val tag = "DU/RTC"
             try {
-                val socketUrl = wsUrl
-                    ?: when (role) {
-                        StreamRole.VICTIM -> _broadcasterWs.value
-                        StreamRole.HELPER -> _viewerWs.value
-                    }
-                    ?: throw IllegalStateException("No websocket URL for role=$role (room=$roomId)")
+                val socketUrl = wsUrl ?: when (role) {
+                    StreamRole.VICTIM -> _broadcasterWs.value
+                    StreamRole.HELPER -> _viewerWs.value
+                } ?: throw IllegalStateException("Missing WebSocket URL for role=$role")
 
-                Log.d(tag, "startStreaming → role=$role room=$roomId ws=$socketUrl")
+                require(roomId.isNotBlank()) { "Room ID missing" }
 
                 cameraProvider.startStream(
                     wsUrl = socketUrl,
                     context = ctx,
                     roomId = roomId,
                     role = role,
-                    onRemoteVideo = onRemoteVideo
+                    onRemoteVideo = { track ->
+                        setIncomingVideoTrack(track)
+                        onRemoteVideo(track)
+                    }
                 )
 
                 withContext(Dispatchers.Main) {
                     _streamingState.value = StreamingState.Streaming
                     _isSignalingReady.value = true
-                    Log.d(tag, "Streaming=ON role=$role")
                 }
             } catch (t: Throwable) {
-                Log.w(tag, "startStreaming error: ${t.message}", t)
+                Log.e(tag, "startStreaming error", t)
                 withContext(Dispatchers.Main) {
                     _streamError.value = t.message
                     _streamingState.value = StreamingState.Idle
@@ -428,19 +435,18 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     fun stopStreaming() {
         viewModelScope.launch(Dispatchers.Default) {
-            val tag = "DU/RTC"
             try {
                 cameraProvider.stopStream()
-                Log.d(tag, "Streaming=OFF")
             } catch (t: Throwable) {
-                Log.w(tag, "stopStream error: ${t.message}")
+                Log.e("DU/RTC", "stopStreaming error", t)
             } finally {
-                withContext(Dispatchers.Main) { _streamingState.value = StreamingState.Idle }
+                withContext(Dispatchers.Main) {
+                    _streamingState.value = StreamingState.Idle
+                }
             }
         }
     }
 
-    fun isStreaming(): Boolean = cameraProvider.isStreamActive()
 
     // ---------------- Helpers ---------------------------------
     private fun teardownSessionState() {
@@ -457,11 +463,18 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         Log.d("DU/HOME", "Session teardown complete")
     }
 
+
+
+
     fun clearHelpRequest() { _helpRequest.value = null }
     fun resetHelperName() { _helperName.value = null }
 
+    fun isStreaming(): Boolean = cameraProvider.isStreamActive()
+
     override fun onCleared() {
         super.onCleared()
-        try { cameraProvider.stopStream() } catch (_: Throwable) {}
+        viewModelScope.launch(Dispatchers.Default) {
+            try { cameraProvider.stopStream() } catch (_: Throwable) {}
+        }
     }
 }

@@ -14,9 +14,9 @@ class SignalingSocket(
 ) {
 
     interface Listener {
-        fun onOfferReceived(sdp: String)        // raw SDP
-        fun onAnswerReceived(sdp: String)       // raw SDP
-        fun onIceCandidateReceived(candidate: String) // JSON string of IceCandidateInit
+        fun onOfferReceived(sdp: String)
+        fun onAnswerReceived(sdp: String)
+        fun onIceCandidateReceived(candidateJson: String)
         fun onSocketOpened()
         fun onSocketClosed()
     }
@@ -25,7 +25,7 @@ class SignalingSocket(
 
     private val client = OkHttpClient.Builder()
         .connectTimeout(10, TimeUnit.SECONDS)
-        .readTimeout(0, TimeUnit.SECONDS)
+        .readTimeout(0, TimeUnit.SECONDS) // streaming messages
         .writeTimeout(10, TimeUnit.SECONDS)
         .pingInterval(15, TimeUnit.SECONDS)
         .build()
@@ -39,9 +39,11 @@ class SignalingSocket(
     private data class Outgoing(val json: JSONObject)
     private val outbound = ConcurrentLinkedQueue<Outgoing>()
 
+    /** Connects to the signaling server WebSocket */
     fun connect() {
         val request = Request.Builder().url(websocketUrl).build()
         webSocket = client.newWebSocket(request, object : WebSocketListener() {
+
             override fun onOpen(ws: WebSocket, response: Response) {
                 Log.d(TAG, "OPEN @ $websocketUrl code=${response.code}")
                 isOpen.set(true)
@@ -51,51 +53,7 @@ class SignalingSocket(
 
             override fun onMessage(ws: WebSocket, text: String) {
                 Log.d(TAG, "RECV: $text")
-                try {
-                    val root = JSONObject(text)
-                    val event = root.optString("event", "")
-                    val rawData = root.opt("data")
-
-                    // Normalize "data" so downstream always gets what it expects:
-                    // - For offer/answer: pass RAW SDP string
-                    // - For candidate: pass JSON string of IceCandidateInit
-                    val normalized: String = when (rawData) {
-                        is String -> {
-                            val s = rawData.trim()
-                            if (s.startsWith("{") && s.endsWith("}")) {
-                                val obj = JSONObject(s)
-                                when (event) {
-                                    "offer", "answer" -> obj.optString("sdp", "")
-                                    "candidate" -> obj.toString()
-                                    else -> s
-                                }
-                            } else {
-                                // Plain string (rare on this server, but keep for safety)
-                                if (event == "candidate") {
-                                    // Wrap as candidate JSON with just "candidate"
-                                    JSONObject().put("candidate", s).toString()
-                                } else s
-                            }
-                        }
-                        is JSONObject -> {
-                            when (event) {
-                                "offer", "answer" -> rawData.optString("sdp", "")
-                                "candidate" -> rawData.toString()
-                                else -> rawData.toString()
-                            }
-                        }
-                        else -> ""
-                    }
-
-                    when (event) {
-                        "offer"     -> signalingListener.onOfferReceived(normalized)
-                        "answer"    -> signalingListener.onAnswerReceived(normalized)
-                        "candidate" -> signalingListener.onIceCandidateReceived(normalized)
-                        else        -> Log.w(TAG, "Unknown event: $event")
-                    }
-                } catch (t: Throwable) {
-                    Log.w(TAG, "Parse error: ${t.message}")
-                }
+                parseIncomingMessage(text)
             }
 
             override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) {
@@ -112,40 +70,22 @@ class SignalingSocket(
         })
     }
 
-    // ---------- Public send helpers ----------
-    // Server expects JSON objects for SDP/candidates
-    fun sendOffer(sdp: String, roomId: String) =
-        send("offer", JSONObject().put("type", "offer").put("sdp", sdp), roomId)
+    /** Outgoing message helpers **/
+    fun sendOffer(sdp: String, roomId: String)    = send("offer", sdp, roomId)
+    fun sendAnswer(sdp: String, roomId: String)   = send("answer", sdp, roomId)
+    fun sendCandidate(candidateJson: String, roomId: String) =
+        send("candidate", candidateJson, roomId)
 
-    fun sendAnswer(sdp: String, roomId: String) =
-        send("answer", JSONObject().put("type", "answer").put("sdp", sdp), roomId)
-
-    // Preferred (structured) candidate
-    fun sendCandidate(sdpMid: String?, sdpMLineIndex: Int, candidate: String, roomId: String) =
-        send(
-            "candidate",
-            JSONObject()
-                .put("candidate", candidate)
-                .put("sdpMid", sdpMid ?: JSONObject.NULL)
-                .put("sdpMLineIndex", sdpMLineIndex),
-            roomId
-        )
-
-    // Legacy fallback (still wraps as JSON)
-    fun sendCandidate(candidate: String, roomId: String) =
-        send("candidate", JSONObject().put("candidate", candidate), roomId)
-
-    // ---------- Core send ----------
-    private fun send(event: String, data: JSONObject, roomId: String) {
+    private fun send(event: String, data: String, roomId: String) {
         val obj = JSONObject()
             .put("event", event)
-            .put("data", data)           // NOTE: JSON object, not a plain string
+            .put("data", data)
             .put("roomId", roomId)
 
         if (isOpen.get()) {
             val ok = webSocket?.send(obj.toString()) ?: false
             if (!ok) {
-                Log.w(TAG, "Send failed (ws null); queueing $event")
+                Log.w(TAG, "Send failed; queueing $event")
                 outbound.add(Outgoing(obj))
             } else {
                 Log.d(TAG, "SEND $event size=${obj.toString().length}")
@@ -157,6 +97,7 @@ class SignalingSocket(
         }
     }
 
+    /** Flush queued messages once connected */
     private fun flushQueued() {
         scope.launch {
             var count = 0
@@ -169,6 +110,7 @@ class SignalingSocket(
         }
     }
 
+    /** Retry flush until connected or give up */
     private var backoffJob: Job? = null
     private fun scheduleFlushBackoff() {
         if (backoffJob?.isActive == true) return
@@ -183,10 +125,43 @@ class SignalingSocket(
         }
     }
 
+    /** Parse & dispatch server messages safely */
+    private fun parseIncomingMessage(text: String) {
+        runCatching {
+            val json = JSONObject(text)
+            val event = json.optString("event", "")
+            val dataAny = json.opt("data")
+
+            fun extractSdp(raw: Any?): String = when (raw) {
+                is JSONObject -> raw.optString("sdp", "")
+                is String -> if (raw.trim().startsWith("{")) {
+                    JSONObject(raw).optString("sdp", raw)
+                } else raw
+                else -> ""
+            }
+
+            fun normalizeCandidate(raw: Any?): String = when (raw) {
+                is JSONObject -> raw.toString()
+                is String -> if (raw.trim().startsWith("{")) raw
+                else JSONObject().put("candidate", raw).toString()
+                else -> JSONObject().put("candidate", "").toString()
+            }
+
+            when (event) {
+                "offer" -> signalingListener.onOfferReceived(extractSdp(dataAny))
+                "answer" -> signalingListener.onAnswerReceived(extractSdp(dataAny))
+                "candidate" -> signalingListener.onIceCandidateReceived(normalizeCandidate(dataAny))
+                else -> Log.w(TAG, "Unknown event: $event")
+            }
+        }.onFailure {
+            Log.w(TAG, "Parse error: ${it.message}")
+        }
+    }
+
     fun isConnected(): Boolean = isOpen.get()
 
     fun close(code: Int = 1000, reason: String = "Client closing") {
-        try { webSocket?.close(code, reason) } catch (_: Throwable) {}
+        runCatching { webSocket?.close(code, reason) }
         webSocket = null
         isOpen.set(false)
         outbound.clear()

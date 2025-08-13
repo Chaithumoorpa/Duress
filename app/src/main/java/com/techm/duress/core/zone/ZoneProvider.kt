@@ -3,7 +3,7 @@ package com.techm.duress.core.zone
 import android.content.Context
 import android.util.Log
 import androidx.compose.ui.geometry.Offset
-import com.techm.duress.models.ZoneModel
+import com.techm.duress.model.ZoneModel
 import org.json.JSONArray
 import org.json.JSONException
 import org.json.JSONObject
