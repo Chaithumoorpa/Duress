@@ -47,6 +47,9 @@ fun HomeScreen(
     val broadcasterWs by viewModel.broadcasterWs.collectAsState()
     val viewerWs by viewModel.viewerWs.collectAsState()
 
+    // NEW: collect role so we can gate preview rendering to VICTIM only
+    val role by viewModel.role.collectAsState()
+
     // ---------- Local UI state ----------
     var dialogVisible by remember { mutableStateOf(false) }
     var giveHelpBtnPressed by remember { mutableStateOf(false) }
@@ -102,10 +105,15 @@ fun HomeScreen(
         if (fallDetected && !isHelpSessionActive) {
             Log.d(TAG, "Fall detected → sendHelpRequest (zone=${ZoneDetector.currentZone.value})")
             viewModel.setStreamingState(StreamingState.Signaling)
-            viewModel.sendHelpRequest(ZoneDetector.currentZone.value) {
-                Log.d(TAG, "Help request created: roomId=${roomId}, bWS=${broadcasterWs}, vWS=${viewerWs}")
-                isCameraOn.value = true
+            viewModel.sendHelpRequest(ZoneDetector.currentZone.value) { rid, bWS, vWS ->
                 startPolling = true
+                isCameraOn.value = true
+                viewModel.setStreamingState(StreamingState.Signaling)
+                viewModel.startStreaming(
+                    wsUrl = bWS,
+                    roomId = rid,
+                    role = CameraServiceProvider.StreamRole.VICTIM
+                ) { /* Victim ignores remote */ }
             }
         }
     }
@@ -123,9 +131,8 @@ fun HomeScreen(
     LaunchedEffect(status) {
         if (status == "closed") {
             Log.d(TAG, "Status=closed → cleanup")
-            // NEW: hide any open dialog and clear request so it can't re-open
-            dialogVisible = false                  // NEW
-            viewModel.clearHelpRequest()           // NEW
+            dialogVisible = false
+            viewModel.clearHelpRequest()
 
             pollingSupervisor.cancelChildren()
             startPolling = false
@@ -138,7 +145,6 @@ fun HomeScreen(
         }
     }
 
-
     // Dispose: stop stream if screen leaves
     DisposableEffect(Unit) {
         onDispose {
@@ -147,23 +153,7 @@ fun HomeScreen(
         }
     }
 
-    LaunchedEffect(isSignalingReady, roomId, broadcasterWs, streamingState) {
-        if (isSignalingReady &&
-            streamingState == StreamingState.Idle &&
-            !broadcasterWs.isNullOrBlank() &&
-            !roomId.isNullOrBlank()
-        ) {
-            Log.d("DU/HOME", "Auto-start victim stream: ws=$broadcasterWs room=$roomId")
-            viewModel.startStreaming(
-                wsUrl = broadcasterWs!!,
-                roomId = roomId!!,
-                role = CameraServiceProvider.StreamRole.VICTIM
-            ) { /* Victim ignores remote */ }
-            // If your CameraView depends on a local flag, flip it here:
-            // isCameraOn.value = true
-        }
-    }
-
+    // (Optional) victim auto-start hook was intentionally commented out in your version
 
     // Victim: poll for helper assignment while waiting
     LaunchedEffect(startPolling) {
@@ -184,24 +174,32 @@ fun HomeScreen(
     }
 
     // Helper: when Give Help is pressed, auto start HELPER stream (if we know roomId + viewerWs)
-    LaunchedEffect(giveHelpBtnPressed, viewerWs, roomId) {
-        if (giveHelpBtnPressed) {
-            if (viewerWs.isNullOrBlank() || roomId.isNullOrBlank()) {
-                Log.w(TAG, "Helper join pending: viewerWs/roomId missing (viewerWs=$viewerWs, roomId=$roomId)")
-            } else {
-                Log.d(TAG, "Helper join: viewerWs=$viewerWs roomId=$roomId state=$streamingState")
-                if (streamingState == StreamingState.Idle) {
+    LaunchedEffect(giveHelpBtnPressed) {
+        if (!giveHelpBtnPressed) return@LaunchedEffect
+        Log.d(TAG, "Helper join flow started")
+        // Try for ~30s (3s * 10) to wait for URLs from server
+        repeat(10) { attempt ->
+            val vws = viewModel.viewerWs.value
+            val rid = viewModel.roomId.value
+            if (!vws.isNullOrBlank() && !rid.isNullOrBlank()) {
+                Log.d(TAG, "Helper join: viewerWs=$vws roomId=$rid")
+                if (viewModel.streamingState.value == StreamingState.Idle) {
                     viewModel.startStreaming(
-                        wsUrl = viewerWs!!,
-                        roomId = roomId!!,
+                        wsUrl = vws,
+                        roomId = rid,
                         role = CameraServiceProvider.StreamRole.HELPER
                     ) { track: VideoTrack ->
                         Log.d(TAG, "Helper received remote track")
                         viewModel.setIncomingVideoTrack(track)
                     }
                 }
+                return@LaunchedEffect
+            } else {
+                Log.w(TAG, "Helper join pending (attempt ${attempt + 1}): viewerWs/roomId missing")
+                delay(3000)
             }
         }
+        Log.w(TAG, "Helper join timed out waiting for viewerWs/roomId")
     }
 
     Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
@@ -222,9 +220,16 @@ fun HomeScreen(
                         .padding(horizontal = 8.dp),
                     verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    // Victim local preview UI
-                    if (isCameraOn.value && isSignalingReady) {
-                        Log.d(TAG, "Render CameraView (isCameraOn=${isCameraOn.value}, signaling=$isSignalingReady)")
+                    // Victim local preview UI — GATED BY ROLE = VICTIM
+                    if (
+                        role == CameraServiceProvider.StreamRole.VICTIM &&
+                        streamingState != StreamingState.Idle &&
+                        isSignalingReady
+                    ) {
+                        Log.d(
+                            TAG,
+                            "Render CameraView (role=VICTIM, isCameraOn=${isCameraOn.value}, signaling=$isSignalingReady)"
+                        )
                         CameraView(
                             viewModel = viewModel,
                             modifier = Modifier.fillMaxWidth()
@@ -326,12 +331,21 @@ fun HomeScreen(
                                 if (isDuressDetected.value) {
                                     Log.d(TAG, "Duress pressed → sendHelpRequest")
                                     viewModel.setStreamingState(StreamingState.Signaling)
-                                    viewModel.sendHelpRequest(ZoneDetector.currentZone.value) {
+                                    viewModel.sendHelpRequest(ZoneDetector.currentZone.value) { rid, bWS, vWS ->
                                         startPolling = true
                                         isCameraOn.value = true
+                                        viewModel.setStreamingState(StreamingState.Signaling)
+                                        viewModel.startStreaming(
+                                            wsUrl = bWS,
+                                            roomId = rid,
+                                            role = CameraServiceProvider.StreamRole.VICTIM
+                                        ) { /* Victim ignores remote */ }
                                     }
                                 } else {
-                                    Log.d(TAG, "Finish pressed → help_completed (victimName=$userName, helper=${helperName ?: ""})")
+                                    Log.d(
+                                        TAG,
+                                        "Finish pressed → help_completed (victimName=$userName, helper=${helperName ?: ""})"
+                                    )
                                     // Victim can always finish with their own name; helper may be empty if not yet assigned
                                     viewModel.sendHelpCompleted(
                                         victimName = userName,
@@ -391,5 +405,4 @@ fun HomeScreen(
             )
         }
     }
-
 }

@@ -31,7 +31,7 @@ enum class StreamingState { Idle, Signaling, Streaming }
 class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     // --- Config ---------------------------------------------------------------
-    var baseUrl: String = "http://10.246.34.42:8080/duress" // TODO: inject/env for prod
+    var baseUrl: String = "http://10.136.125.42:8080/duress" // TODO: inject/env for prod
 
     // --- User/session model ---------------------------------------------------
     private val _userName = MutableStateFlow("")
@@ -61,7 +61,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     private val _isHelpSessionActive = MutableStateFlow(false)
     val isHelpSessionActive: StateFlow<Boolean> = _isHelpSessionActive
 
-    private val _isSignalingReady = MutableStateFlow(false)        // turns true when helper is assigned
+    private val _isSignalingReady = MutableStateFlow(false)
     val isSignalingReady: StateFlow<Boolean> = _isSignalingReady
 
     private val _streamingState = MutableStateFlow(StreamingState.Idle)
@@ -99,15 +99,11 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     }
     fun markSignalingReady(ready: Boolean) { _isSignalingReady.value = ready }
 
-    // ---------------- Victim: create duress ------------------
-
-    // ---------------- Victim: create duress (FORM-ENCODED) ------------------
-    // ---------------- Victim: create duress (JSON, as before) ------------------
-    // ---------------- Victim: create duress (JSON, as before) ------------------
+    // ---------------- Victim: create duress (JSON) ----------------------------
     fun sendHelpRequest(
         currentUserZone: String,
-        mobile: String = "123456789", // or "1234567890" if you prefer
-        onComplete: () -> Unit = {}
+        mobile: String = "123456789",
+        onCreated: (roomId: String, broadcasterWs: String, viewerWs: String) -> Unit = { _, _, _ -> }
     ) {
         viewModelScope.launch(Dispatchers.IO) {
             val tag = "DU/HTTP"
@@ -140,23 +136,28 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
                 if (code == HttpURLConnection.HTTP_OK) {
                     val js = JSONObject(body)
-                    val room = js.optString("roomId").ifBlank { null }
-                    val bws  = js.optString("broadcasterWs").ifBlank { null }
-                    val vws  = js.optString("viewerWebsocketUrl").ifBlank { null }
 
-                    withContext(Dispatchers.Main) {
-                        _roomId.value = room
-                        _broadcasterWs.value = bws
-                        _viewerWs.value = vws
-                        _isHelpSessionActive.value = true
-                        _sessionStatus.value = "open"
-                        _isSignalingReady.value = false
+                    val room = js.optString("roomId").orEmpty()
+                    val bws  = js.optString("broadcasterWs").orEmpty()
+                    val vws  = js.optString("viewerWebsocketUrl").orEmpty()
 
-                        // keep a local copy so victim can call /help_completed
-                        _requestingUser.value = HelpRequest(_userName.value, currentUserZone)
+                    if (room.isNotBlank() && bws.isNotBlank() && vws.isNotBlank()) {
+                        withContext(Dispatchers.Main) {
+                            _roomId.value = room
+                            _broadcasterWs.value = bws
+                            _viewerWs.value = vws
+                            _isHelpSessionActive.value = true
+                            _sessionStatus.value = "open"
+                            _isSignalingReady.value = false
 
-                        Log.d("DU/HOME", "Help created roomId=$room bWS=$bws vWS=$vws")
-                        onComplete()
+                            // keep a local copy so victim can call /help_completed
+                            _requestingUser.value = HelpRequest(_userName.value, currentUserZone)
+
+                            Log.d("DU/HOME", "Help created roomId=$room bWS=$bws vWS=$vws")
+                            onCreated(room, bws, vws)
+                        }
+                    } else {
+                        Log.e(tag, "Missing fields in /help response: roomId='$room', bWS='$bws', vWS='$vws'")
                     }
                 } else {
                     Log.e(tag, "help: $code ${conn.responseMessage}")
@@ -168,11 +169,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-
-
-    // ---------------- Helper: poll for open requests ---------
-
-    // ---------------- Helper: poll for open requests (name/zone/mobile only) ---
+    // ---------------- Helper: poll for open requests --------------------------
+    // Also captures roomId + websocket URLs if the server includes them.
     fun checkForHelpRequest(currentUserName: String) {
         viewModelScope.launch(Dispatchers.IO) {
             val tag = "DU/HTTP"
@@ -197,12 +195,21 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                     val js = JSONObject(body)
                     val victim = js.optString("name").orEmpty()
                     val zone   = js.optString("zone").orEmpty()
-                    // mobile exists but not used in UI
+
+                    // Optional fields (present after your server refactor)
+                    val room = js.optString("roomId").orEmpty()
+                    val vws  = js.optString("viewerWebsocketUrl").orEmpty()
+                    val bws  = js.optString("broadcasterWs").orEmpty()
 
                     withContext(Dispatchers.Main) {
                         if (victim.isNotBlank() && victim != currentUserName) {
                             _helpRequest.value = HelpRequest(victim, zone)
                             Log.d("DU/HOME", "Incoming request from $victim in $zone")
+
+                            // If server gave us session info, store it so helper can auto-join later.
+                            if (room.isNotBlank()) _roomId.value = room
+                            if (vws.isNotBlank()) _viewerWs.value = vws
+                            if (bws.isNotBlank()) _broadcasterWs.value = bws
                         } else {
                             _helpRequest.value = null
                         }
@@ -217,11 +224,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-
-
-    // --------------- Helper: accept request -------------------
-
-    // --------------- Helper: accept request (form-encoded) ---------------------
+    // --------------- Helper: accept request (form-encoded) --------------------
     fun sendGiveHelpRequest(victimName: String, helper: String, onSuccess: () -> Unit) {
         viewModelScope.launch(Dispatchers.IO) {
             val tag = "DU/HTTP"
@@ -265,11 +268,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-
-
-    // --------------- Victim: wait for helper assignment -------
-
-    // --------------- Victim: wait for helper assignment (form) -----------------
+    // --------------- Victim: wait for helper assignment (form) ----------------
+    // Also captures roomId + websocket URLs if the server includes them.
     fun listenForHelper(victimName: String) {
         viewModelScope.launch(Dispatchers.IO) {
             val tag = "DU/HTTP"
@@ -300,7 +300,16 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                     val helper = js.optString("helper").orEmpty()
                     val statusValue = js.optString("status").orEmpty()
 
+                    // Optional fields (present after your server refactor)
+                    val room = js.optString("roomId").orEmpty()
+                    val vws  = js.optString("viewerWebsocketUrl").orEmpty()
+                    val bws  = js.optString("broadcasterWs").orEmpty()
+
                     withContext(Dispatchers.Main) {
+                        if (room.isNotBlank()) _roomId.value = room
+                        if (vws.isNotBlank()) _viewerWs.value = vws
+                        if (bws.isNotBlank()) _broadcasterWs.value = bws
+
                         if (helper.isNotBlank() && statusValue.equals("open", ignoreCase = true)) {
                             _helperName.value = helper
                             _isHelpSessionActive.value = true
@@ -326,11 +335,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-
-
-    // ---------------- Either role: finish session --------------
-
-    // ---------------- Either role: finish session (form) ------------------------
+    // ---------------- Either role: finish session (form) ----------------------
     fun sendHelpCompleted(victimName: String, helper: String, onSuccess: () -> Unit) {
         viewModelScope.launch(Dispatchers.IO) {
             val tag = "DU/HTTP"
@@ -355,7 +360,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 } catch (_: Throwable) {
                     conn.errorStream?.bufferedReader()?.use { it.readText() } ?: ""
                 }
-                Log.d(tag, "<- $code /help_completed body=${if (body.isBlank()) "<empty>" else body}")
+                Log.d(tag, "<- $code /help_completed body=${if (body.isBlank()) "<empty>" else body}}")
 
                 if (code == HttpURLConnection.HTTP_OK) {
                     val js = JSONObject(body)
@@ -374,9 +379,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-
-    // ---------------- Streaming control (both roles) -----------
-
+    // ---------------- Streaming control (both roles) --------------------------
     fun startStreaming(
         wsUrl: String?,              // may be null; we’ll pick from state
         roomId: String,
@@ -440,7 +443,6 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     fun isStreaming(): Boolean = cameraProvider.isStreamActive()
 
     // ---------------- Helpers ---------------------------------
-
     private fun teardownSessionState() {
         _roomId.value = null
         _broadcasterWs.value = null
