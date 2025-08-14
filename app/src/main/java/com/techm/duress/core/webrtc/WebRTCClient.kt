@@ -16,16 +16,13 @@ class WebRTCClient(
         fun onLocalSDPGenerated(sdp: SessionDescription)
         fun onIceCandidateFound(candidate: IceCandidate)
         fun onRemoteVideoTrackReceived(track: VideoTrack)
-
-        /** NEW: Called when local video track is ready so preview can bind immediately */
         fun onLocalVideoTrackCreated(track: VideoTrack)
     }
-
 
     private val TAG = "DU/RTC"
 
     private val eglBase: EglBase = EglBase.create()
-    private var peerConnectionFactory: PeerConnectionFactory
+    private val peerConnectionFactory: PeerConnectionFactory
 
     private var peerConnection: PeerConnection? = null
     private var localVideoSource: VideoSource? = null
@@ -34,12 +31,11 @@ class WebRTCClient(
     private var localAudioTrack: AudioTrack? = null
     private var videoCapturer: VideoCapturer? = null
     private var surfaceTextureHelper: SurfaceTextureHelper? = null
-
     private var localPreviewSink: VideoSink? = null
 
     private val pendingCandidates = mutableListOf<IceCandidate>()
     private var remoteSdpSet = false
-    private var answerMode = false // true=HELPER (answerer), false=VICTIM (offerer)
+    private var answerMode = false
 
     private var videoTransceiver: RtpTransceiver? = null
 
@@ -77,12 +73,12 @@ class WebRTCClient(
             peerConnection = peerConnectionFactory.createPeerConnection(
                 rtcConfig,
                 object : PeerConnection.Observer {
-                    override fun onSignalingChange(newState: PeerConnection.SignalingState?) {
-                        Log.d(TAG, "SignalingState=$newState")
+                    override fun onSignalingChange(state: PeerConnection.SignalingState?) {
+                        Log.d(TAG, "SignalingState=$state")
                     }
 
-                    override fun onIceConnectionChange(newState: PeerConnection.IceConnectionState?) {
-                        Log.d(TAG, "IceConnectionState=$newState")
+                    override fun onIceConnectionChange(state: PeerConnection.IceConnectionState?) {
+                        Log.d(TAG, "IceConnectionState=$state")
                     }
 
                     override fun onIceGatheringChange(state: PeerConnection.IceGatheringState?) {
@@ -96,52 +92,51 @@ class WebRTCClient(
                         }
                     }
 
-                    override fun onIceCandidatesRemoved(cands: Array<out IceCandidate>?) {}
-
-                    override fun onAddStream(p0: MediaStream?) {} // deprecated
-
-                    override fun onRemoveStream(p0: MediaStream?) {}
-
-                    override fun onDataChannel(p0: DataChannel?) {}
-
-                    override fun onRenegotiationNeeded() {
-                        Log.d(TAG, "Renegotiation needed")
-                    }
-
                     override fun onAddTrack(receiver: RtpReceiver?, mediaStreams: Array<out MediaStream>?) {
-                        val track = receiver?.track()
-                        if (track is VideoTrack) {
-                            Log.d(TAG, "Remote VideoTrack: ${track.id()}")
-                            signalingCallback.onRemoteVideoTrackReceived(track)
+                        (receiver?.track() as? VideoTrack)?.let {
+                            Log.d(TAG, "Remote VideoTrack received")
+                            it.setEnabled(true)
+                            signalingCallback.onRemoteVideoTrackReceived(it)
                         }
                     }
 
                     override fun onTrack(transceiver: RtpTransceiver?) {}
-
-                    override fun onConnectionChange(newState: PeerConnection.PeerConnectionState?) {
-                        Log.d(TAG, "PeerConnectionState=$newState")
+                    override fun onConnectionChange(state: PeerConnection.PeerConnectionState?) {
+                        Log.d(TAG, "PeerConnectionState=$state")
                     }
 
+                    // Unused old callbacks
+                    override fun onIceCandidatesRemoved(cands: Array<out IceCandidate>?) {}
+                    override fun onAddStream(p0: MediaStream?) {}
+                    override fun onRemoveStream(p0: MediaStream?) {}
+                    override fun onDataChannel(p0: DataChannel?) {}
+                    override fun onRenegotiationNeeded() {}
                     override fun onIceConnectionReceivingChange(p0: Boolean) {}
                 }
             )
 
-            // Transceivers
-            val videoDir = if (!answerMode) RtpTransceiver.RtpTransceiverDirection.SEND_ONLY
-            else RtpTransceiver.RtpTransceiverDirection.RECV_ONLY
+            // Transceivers: victim SEND_ONLY, helper RECV_ONLY
+            val videoDir = if (!answerMode)
+                RtpTransceiver.RtpTransceiverDirection.SEND_ONLY
+            else
+                RtpTransceiver.RtpTransceiverDirection.RECV_ONLY
+
             videoTransceiver = peerConnection?.addTransceiver(
                 MediaStreamTrack.MediaType.MEDIA_TYPE_VIDEO,
                 RtpTransceiver.RtpTransceiverInit(videoDir)
             )
 
-            val audioDir = if (!answerMode) RtpTransceiver.RtpTransceiverDirection.SEND_ONLY
-            else RtpTransceiver.RtpTransceiverDirection.RECV_ONLY
+            val audioDir = if (!answerMode)
+                RtpTransceiver.RtpTransceiverDirection.SEND_ONLY
+            else
+                RtpTransceiver.RtpTransceiverDirection.RECV_ONLY
+
             peerConnection?.addTransceiver(
                 MediaStreamTrack.MediaType.MEDIA_TYPE_AUDIO,
                 RtpTransceiver.RtpTransceiverInit(audioDir)
             )
 
-            // Local audio (victim only)
+            // Always create audio track; add to PC in victim mode
             localAudioSource = peerConnectionFactory.createAudioSource(MediaConstraints())
             localAudioTrack = peerConnectionFactory.createAudioTrack("audio_track", localAudioSource)
             if (!answerMode) {
@@ -152,7 +147,7 @@ class WebRTCClient(
 
     fun startLocalVideo(context: Context) {
         if (answerMode) {
-            Log.d(TAG, "Helper mode: startLocalVideo() ignored")
+            Log.d(TAG, "Helper mode: no local camera start")
             return
         }
 
@@ -168,18 +163,16 @@ class WebRTCClient(
         localVideoTrack?.let { signalingCallback.onLocalVideoTrackCreated(it) }
         localPreviewSink?.let { sink -> localVideoTrack?.addSink(sink) }
 
+        // Bind to sender
         try {
             val sender = videoTransceiver?.sender
-            if (sender != null) {
-                sender.setTrack(localVideoTrack, true)
-            } else {
-                peerConnection?.addTrack(localVideoTrack)
-            }
+            if (sender != null) sender.setTrack(localVideoTrack, true)
+            else peerConnection?.addTrack(localVideoTrack)
         } catch (_: Throwable) {
             try { peerConnection?.addTrack(localVideoTrack) } catch (_: Throwable) {}
         }
 
-        Log.d(TAG, "Local video started → createOffer()")
+        Log.d(TAG, "Local video started — creating OFFER")
         createOffer()
     }
 
@@ -190,74 +183,35 @@ class WebRTCClient(
         videoCapturer = null
         surfaceTextureHelper = null
 
-        localVideoTrack?.let { track ->
-            try { track.setEnabled(false) } catch (_: Throwable) {}
-            try { localPreviewSink?.let { track.removeSink(it) } } catch (_: Throwable) {}
-            try { track.dispose() } catch (_: Throwable) {}
+        localVideoTrack?.apply {
+            setEnabled(false)
+            localPreviewSink?.let { removeSink(it) }
+            dispose()
         }
         localVideoTrack = null
 
-        try { localVideoSource?.dispose() } catch (_: Throwable) {}
+        localVideoSource?.dispose()
         localVideoSource = null
     }
 
     fun setRemoteSDP(sdp: String) {
         val type = if (answerMode) SessionDescription.Type.OFFER else SessionDescription.Type.ANSWER
-        Log.d(TAG, "Setting remote $type (len=${sdp.length})")
-
         val remote = SessionDescription(type, sdp)
         val pc = peerConnection ?: return
 
         pc.setRemoteDescription(object : SdpObserver {
             override fun onSetSuccess() {
+                Log.d(TAG, "Remote SDP set: $type")
                 remoteSdpSet = true
-                Log.d(TAG, "Remote $type set")
+                flushPendingCandidates()
                 if (type == SessionDescription.Type.OFFER) {
                     createAnswer()
-                } else {
-                    pendingCandidates.forEach { cand ->
-                        try { pc.addIceCandidate(cand) } catch (_: Throwable) {}
-                    }
-                    pendingCandidates.clear()
                 }
             }
-
-            override fun onSetFailure(error: String?) {
-                Log.e(TAG, "setRemoteDescription failed: $error")
-            }
-
-            override fun onCreateSuccess(sdp: SessionDescription?) {}
-            override fun onCreateFailure(error: String?) {}
+            override fun onSetFailure(error: String?) { Log.e(TAG, "setRemoteDescription failed: $error") }
+            override fun onCreateSuccess(p0: SessionDescription?) {}
+            override fun onCreateFailure(p0: String?) {}
         }, remote)
-    }
-
-    /** Public helper-callable Answer creation */
-    fun createAnswer() {
-        val pc = peerConnection ?: return
-        Log.d(TAG, "createAnswer() called explicitly")
-        CoroutineScope(Dispatchers.Default).launch {
-            pc.createAnswer(object : SdpObserver {
-                override fun onCreateSuccess(sdp: SessionDescription?) {
-                    if (sdp == null) { Log.e(TAG, "createAnswer returned null"); return }
-                    pc.setLocalDescription(object : SdpObserver {
-                        override fun onSetSuccess() {
-                            Log.d(TAG, "Local ANSWER set → send to server")
-                            pendingCandidates.forEach { cand ->
-                                try { pc.addIceCandidate(cand) } catch (_: Throwable) {}
-                            }
-                            pendingCandidates.clear()
-                            signalingCallback.onLocalSDPGenerated(sdp)
-                        }
-                        override fun onSetFailure(error: String?) { Log.e(TAG, "setLocal(answer) failed: $error") }
-                        override fun onCreateSuccess(p0: SessionDescription?) {}
-                        override fun onCreateFailure(p0: String?) {}
-                    }, sdp)
-                }
-                override fun onCreateFailure(error: String?) { Log.e(TAG, "createAnswer failed: $error") }
-                override fun onSetSuccess() {}
-                override fun onSetFailure(error: String?) {}
-            }, MediaConstraints())
-        }
     }
 
     private fun createOffer() {
@@ -284,18 +238,47 @@ class WebRTCClient(
         }
     }
 
-    fun addRemoteIceCandidate(mid: String?, index: Int, candidate: String) {
+    fun createAnswer() {
         val pc = peerConnection ?: return
+        CoroutineScope(Dispatchers.Default).launch {
+            pc.createAnswer(object : SdpObserver {
+                override fun onCreateSuccess(sdp: SessionDescription?) {
+                    if (sdp == null) { Log.e(TAG, "createAnswer returned null"); return }
+                    pc.setLocalDescription(object : SdpObserver {
+                        override fun onSetSuccess() {
+                            Log.d(TAG, "Local ANSWER set → send to server")
+                            flushPendingCandidates()
+                            signalingCallback.onLocalSDPGenerated(sdp)
+                        }
+                        override fun onSetFailure(error: String?) { Log.e(TAG, "setLocal(answer) failed: $error") }
+                        override fun onCreateSuccess(p0: SessionDescription?) {}
+                        override fun onCreateFailure(p0: String?) {}
+                    }, sdp)
+                }
+                override fun onCreateFailure(error: String?) { Log.e(TAG, "createAnswer failed: $error") }
+                override fun onSetSuccess() {}
+                override fun onSetFailure(error: String?) {}
+            }, MediaConstraints())
+        }
+    }
+
+    fun addRemoteIceCandidate(mid: String?, index: Int, candidate: String) {
         val ice = IceCandidate(mid ?: "", if (index >= 0) index else 0, candidate)
         if (remoteSdpSet) {
-            try { pc.addIceCandidate(ice) } catch (t: Throwable) { Log.w(TAG, "addIce failed: ${t.message}") }
+            try { peerConnection?.addIceCandidate(ice) } catch (t: Throwable) { Log.w(TAG, "addIce failed: ${t.message}") }
         } else {
             pendingCandidates.add(ice)
             Log.d(TAG, "Queued ICE (remote SDP not set yet)")
         }
     }
 
-    fun addRemoteIceCandidate(candidate: String) = addRemoteIceCandidate("", 0, candidate)
+    private fun flushPendingCandidates() {
+        val pc = peerConnection ?: return
+        if (pendingCandidates.isEmpty()) return
+        Log.d(TAG, "Flushing ${pendingCandidates.size} pending ICE candidates")
+        pendingCandidates.forEach { pc.addIceCandidate(it) }
+        pendingCandidates.clear()
+    }
 
     fun setLocalPreviewSink(sink: VideoSink?) {
         localPreviewSink = sink
@@ -305,32 +288,51 @@ class WebRTCClient(
     }
 
     fun release() {
-        try {
-            stopLocalVideo()
-            try { localAudioTrack?.dispose() } catch (_: Throwable) {}
-            localAudioTrack = null
-            try { localAudioSource?.dispose() } catch (_: Throwable) {}
-            localAudioSource = null
-            try { peerConnection?.close() } catch (_: Throwable) {}
-            try { peerConnection?.dispose() } catch (_: Throwable) {}
-            peerConnection = null
-
-            try { peerConnectionFactory.dispose() } catch (_: Throwable) {}
-            Log.d(TAG, "WebRTC resources released")
-        } catch (e: Exception) {
-            Log.e(TAG, "Release error: ${e.message}", e)
-        }
+        stopLocalVideo()
+        try { localAudioTrack?.dispose() } catch (_: Throwable) {}
+        localAudioTrack = null
+        try { localAudioSource?.dispose() } catch (_: Throwable) {}
+        localAudioSource = null
+        try { peerConnection?.close() } catch (_: Throwable) {}
+        try { peerConnection?.dispose() } catch (_: Throwable) {}
+        peerConnection = null
+        peerConnectionFactory.dispose()
     }
 
     private fun createCameraCapturer(): VideoCapturer {
         val enumerator = Camera2Enumerator(context)
-        val names = enumerator.deviceNames
-        for (n in names) if (enumerator.isFrontFacing(n)) {
-            enumerator.createCapturer(n, null)?.let { Log.d(TAG, "Using front camera: $n"); return it }
+        enumerator.deviceNames.firstOrNull { enumerator.isFrontFacing(it) }?.let {
+            return enumerator.createCapturer(it, null) ?: throw IllegalStateException("No camera")
         }
-        for (n in names) if (enumerator.isBackFacing(n)) {
-            enumerator.createCapturer(n, null)?.let { Log.d(TAG, "Using back camera: $n"); return it }
+        enumerator.deviceNames.firstOrNull { enumerator.isBackFacing(it) }?.let {
+            return enumerator.createCapturer(it, null) ?: throw IllegalStateException("No camera")
         }
         throw IllegalStateException("No usable camera device found.")
     }
+
+    fun startInboundStatsDebug(tag: String = "DU/STATS") {
+        val pc = peerConnection ?: return
+        CoroutineScope(Dispatchers.Default).launch {
+            while (true) {
+                try {
+                    pc.getStats { report: RTCStatsReport ->
+                        // report.statsMap: Map<String, RTCStats>
+                        for ((_, s) in report.statsMap) {
+                            if (s.type == "inbound-rtp") {
+                                val kind = s.members["kind"] as? String
+                                if (kind == "video") {
+                                    val bytes = (s.members["bytesReceived"] as? Number)?.toLong()
+                                    val frames = (s.members["framesDecoded"] as? Number)?.toLong()
+                                    Log.d(tag, "inbound-rtp(video) bytes=$bytes framesDecoded=$frames")
+                                }
+                            }
+                        }
+                    }
+                } catch (_: Throwable) { /* ignore */ }
+                kotlinx.coroutines.delay(1000)
+            }
+        }
+    }
+
+
 }

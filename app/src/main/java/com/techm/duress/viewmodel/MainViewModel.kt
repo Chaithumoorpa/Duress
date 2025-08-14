@@ -32,7 +32,7 @@ enum class StreamingState { Idle, Signaling, Streaming }
 class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     // --- Config ---------------------------------------------------------------
-    var baseUrl: String = "http://10.136.125.42:8080/duress" // TODO: inject/env for prod
+    var baseUrl: String = "http://192.168.0.107:8080/duress" // TODO: inject/env for prod
 
     // --- User/session model ---------------------------------------------------
     private val _userName = MutableStateFlow("")
@@ -84,13 +84,16 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     private var webrtcClient: WebRTCClient? = null
 
+    // AFTER (correct target: the provider that owns the live WebRTC client)
     fun attachLocalRenderer(renderer: SurfaceViewRenderer?) {
         try {
-            webrtcClient?.setLocalPreviewSink(renderer)
+            cameraProvider.setLocalPreviewSink(renderer)
+            Log.d("DU/VM", "Local preview renderer attached to CameraServiceProvider")
         } catch (e: Exception) {
             Log.e("DU/VM", "Error attaching local renderer: ${e.message}", e)
         }
     }
+
 
     fun setIncomingVideoTrack(track: VideoTrack) {
         _incomingRemoteVideoTrack.value = track
@@ -317,13 +320,13 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                         if (vws.isNotBlank()) _viewerWs.value = vws
                         if (bws.isNotBlank()) _broadcasterWs.value = bws
 
-                        if (helper.isNotBlank() && statusValue.equals("open", ignoreCase = true)) {
+                        if (helper.isNotBlank() && (statusValue.equals("open", true) || statusValue.equals("taken", true))) {
                             _helperName.value = helper
                             _isHelpSessionActive.value = true
                             _isSignalingReady.value = true
-                            _sessionStatus.value = "open"
+                            _sessionStatus.value = "open"   // treat 'taken' as active session
                             Log.d(tag, "listen_for_helper → helper=$helper, status=$statusValue")
-                        } else if (statusValue.equals("closed", ignoreCase = true) && helper.isBlank()) {
+                        } else if (statusValue.equals("closed", true) && helper.isBlank()) {
                             // Only close if no helper is present
                             _helperName.value = null
                             _sessionStatus.value = "closed"

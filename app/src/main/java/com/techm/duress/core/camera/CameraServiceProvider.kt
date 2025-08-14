@@ -10,7 +10,7 @@ import com.techm.duress.core.webrtc.WebRTCClient
 import org.json.JSONObject
 import org.webrtc.IceCandidate
 import org.webrtc.SessionDescription
-import org.webrtc.VideoSink
+import org.webrtc.SurfaceViewRenderer
 import org.webrtc.VideoTrack
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -28,7 +28,7 @@ class CameraServiceProvider {
     private var webRTCClient: WebRTCClient? = null
 
     private var remoteVideoCallback: ((VideoTrack) -> Unit)? = null
-    private var localPreviewSink: VideoSink? = null
+    private var localPreviewRenderer: SurfaceViewRenderer? = null
     private var localVideoTrack: VideoTrack? = null
 
     private val TAG_WS = "DU/WS"
@@ -37,7 +37,6 @@ class CameraServiceProvider {
     private val TAG_RTC = "DU/RTC"
     private val TAG_LIFE = "DU/LIFECYCLE"
 
-    /** Public API **/
     @MainThread
     fun startStream(
         wsUrl: String,
@@ -59,8 +58,12 @@ class CameraServiceProvider {
         Log.d(TAG_LIFE, "Starting stream → role=$role room=$roomId")
         Log.d(TAG_WS, "WS URL: $wsUrl")
 
-        // Create WebRTC client & connect WebSocket
-        webRTCClient = createRtcClient(appContext!!)
+        webRTCClient = createRtcClient(appContext!!).also { client ->
+            localPreviewRenderer?.let { renderer ->
+                runCatching { client.setLocalPreviewSink(renderer) }
+            }
+        }
+
         signalingSocket = SignalingSocket(wsUrl, createSocketListener()).apply {
             Log.d(TAG_WS, "Connecting WebSocket…")
             connect()
@@ -83,7 +86,7 @@ class CameraServiceProvider {
         webRTCClient = null
         roomId = null
         remoteVideoCallback = null
-        localPreviewSink = null
+        localPreviewRenderer = null
         localVideoTrack = null
         appContext = null
 
@@ -93,29 +96,25 @@ class CameraServiceProvider {
     fun isStreamActive(): Boolean =
         started.get() && signalingSocket != null && webRTCClient != null
 
-    /**
-     * Victim self-preview setup — can be called anytime before or after local track creation.
-     */
-    fun setLocalPreviewSink(sink: VideoSink?) {
-        localPreviewSink = sink
+    fun setLocalPreviewSink(renderer: SurfaceViewRenderer?) {
+        localPreviewRenderer = renderer
+        runCatching { webRTCClient?.setLocalPreviewSink(renderer) }
         localVideoTrack?.let { track ->
-            runCatching { sink?.let { track.addSink(it) } }
+            runCatching { renderer?.let { track.addSink(it) } }
         }
     }
 
-    /** Internal helpers **/
     private fun createRtcClient(appContext: Context): WebRTCClient {
         val t0 = SystemClock.elapsedRealtime()
         Log.d(TAG_RTC, "Init WebRTCClient role=$role")
 
         val client = WebRTCClient(appContext, object : WebRTCClient.SignalingCallback {
-
             override fun onLocalSDPGenerated(sdp: SessionDescription) {
                 val rid = roomId ?: return
-                if (role == StreamRole.VICTIM) {
+                if (role == StreamRole.VICTIM && sdp.type == SessionDescription.Type.OFFER) {
                     Log.d(TAG_SDP, "Local OFFER → send to room=$rid")
                     signalingSocket?.sendOffer(sdp.description, rid)
-                } else {
+                } else if (role == StreamRole.HELPER && sdp.type == SessionDescription.Type.ANSWER) {
                     Log.d(TAG_SDP, "Local ANSWER → send to room=$rid")
                     signalingSocket?.sendAnswer(sdp.description, rid)
                 }
@@ -133,15 +132,15 @@ class CameraServiceProvider {
 
             override fun onRemoteVideoTrackReceived(track: VideoTrack) {
                 Log.d(TAG_RTC, "Remote track received → dispatch to UI")
+                track.setEnabled(true)
                 remoteVideoCallback?.invoke(track)
             }
 
             override fun onLocalVideoTrackCreated(track: VideoTrack) {
                 Log.d(TAG_RTC, "Local video track created — attaching preview sink")
+                track.setEnabled(true)
                 localVideoTrack = track
-                localPreviewSink?.let { sink ->
-                    runCatching { track.addSink(sink) }
-                }
+                localPreviewRenderer?.let { renderer -> runCatching { track.addSink(renderer) } }
             }
         })
 
@@ -151,15 +150,14 @@ class CameraServiceProvider {
     }
 
     private fun createSocketListener(): SignalingSocket.Listener = object : SignalingSocket.Listener {
-
         @WorkerThread
         override fun onSocketOpened() {
             Log.d(TAG_WS, "WebSocket opened → role=$role room=$roomId")
             if (role == StreamRole.VICTIM) {
                 appContext?.let { ctx ->
                     runCatching {
-                        Log.d(TAG_RTC, "Starting local camera (Victim) + sending OFFER")
-                        webRTCClient?.startLocalVideo(ctx)
+                        Log.d(TAG_RTC, "Starting local camera (Victim)")
+                        webRTCClient?.startLocalVideo(ctx) // creates OFFER internally
                     }.onFailure {
                         Log.w(TAG_RTC, "Failed to start local video: ${it.message}")
                     }
@@ -171,15 +169,16 @@ class CameraServiceProvider {
         override fun onOfferReceived(sdp: String) {
             Log.d(TAG_SDP, "Offer received → role=$role")
             runCatching {
-                webRTCClient?.setRemoteSDP(sdp)
+                webRTCClient?.setRemoteSDP(sdp)  // helper auto-creates ANSWER
                 if (role == StreamRole.HELPER) {
-                    Log.d(TAG_SDP, "Creating ANSWER in response to offer…")
-                    webRTCClient?.createAnswer()
+                    webRTCClient?.startInboundStatsDebug()
                 }
             }.onFailure {
                 Log.w(TAG_SDP, "Failed to set remote SDP (offer): ${it.message}")
             }
         }
+
+
 
         @WorkerThread
         override fun onAnswerReceived(sdp: String) {
@@ -194,12 +193,13 @@ class CameraServiceProvider {
             runCatching {
                 val js = runCatching { JSONObject(candidatePayload) }.getOrNull()
                 if (js?.has("candidate") == true) {
-                    val cand = js.getString("candidate")
-                    val mid = js.optString("sdpMid", null)
-                    val mline = js.optInt("sdpMLineIndex", 0)
-                    webRTCClient?.addRemoteIceCandidate(mid, mline, cand)
+                    webRTCClient?.addRemoteIceCandidate(
+                        js.optString("sdpMid", null),
+                        js.optInt("sdpMLineIndex", 0),
+                        js.getString("candidate")
+                    )
                 } else {
-                    webRTCClient?.addRemoteIceCandidate(candidatePayload)
+                    webRTCClient?.addRemoteIceCandidate(null, 0, candidatePayload)
                 }
             }.onFailure {
                 Log.w(TAG_ICE, "Failed to add remote ICE: ${it.message}")

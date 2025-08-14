@@ -17,8 +17,7 @@ import org.webrtc.VideoTrack
 
 /**
  * Displays the incoming video stream to the helper.
- * Renders only when a helper is assigned, the session is open, and a valid VideoTrack is available.
- * Shows a fallback loading UI if video track is missing.
+ * Renders when a helper is assigned, session is OPEN or TAKEN, and a valid VideoTrack is available.
  */
 @Composable
 fun HelperLiveStreamView(
@@ -29,10 +28,11 @@ fun HelperLiveStreamView(
     val context = LocalContext.current
     val eglBase = remember { EglBase.create() }
 
-    // hold a reference to the renderer so we can detach/release cleanly
     var rendererRef by remember { mutableStateOf<SurfaceViewRenderer?>(null) }
 
-    val shouldRender = helperAssigned && sessionStatus == "open" && videoTrack != null
+    // IMPORTANT: allow both "open" and "taken" (helper accepted)
+    val sessionReady = sessionStatus == "open" || sessionStatus == "taken"
+    val shouldRender = helperAssigned && sessionReady && videoTrack != null
 
     Box(
         modifier = Modifier
@@ -46,44 +46,46 @@ fun HelperLiveStreamView(
                 modifier = Modifier.fillMaxSize(),
                 factory = {
                     SurfaceViewRenderer(context).apply {
-                        init(eglBase.eglBaseContext, /* rendererEvents = */ null)
+                        init(eglBase.eglBaseContext, null)
                         setEnableHardwareScaler(true)
                         setScalingType(RendererCommon.ScalingType.SCALE_ASPECT_FIT)
                         setMirror(false)
                         rendererRef = this
                     }
                 },
-                update = { /* no-op; sink is handled via DisposableEffect below */ }
+                update = { /* sink is handled in DisposableEffect */ }
             )
-
-            // Attach/detach sink exactly when track or renderer changes
             DisposableEffect(videoTrack, rendererRef) {
                 val r = rendererRef
                 if (videoTrack != null && r != null) {
-                    videoTrack.addSink(r)
+                    try { videoTrack.setEnabled(true)
+                        videoTrack.addSink(r) } catch (_: Throwable) {}
                 }
                 onDispose {
                     if (videoTrack != null && r != null) {
-                        videoTrack.removeSink(r)
+                        try { videoTrack.removeSink(r) } catch (_: Throwable) {}
                     }
                 }
             }
         } else {
-            Column(
-                horizontalAlignment = Alignment.CenterHorizontally,
+            Column(horizontalAlignment = Alignment.CenterHorizontally,
                 verticalArrangement = Arrangement.Center
             ) {
                 CircularProgressIndicator()
-                Spacer(modifier = Modifier.height(12.dp))
+                Spacer(Modifier.height(12.dp))
                 Text(
-                    text = "Waiting for live stream to start...",
+                    text = when {
+                        !helperAssigned -> "Waiting for a helper to accept…"
+                        !sessionReady   -> "Setting up session…"
+                        videoTrack == null -> "Waiting for live stream to start…"
+                        else -> "Preparing video…"
+                    },
                     style = MaterialTheme.typography.bodyMedium
                 )
             }
         }
     }
 
-    // Release EGL + renderer when this composable leaves the composition
     DisposableEffect(Unit) {
         onDispose {
             try { rendererRef?.release() } catch (_: Throwable) {}
