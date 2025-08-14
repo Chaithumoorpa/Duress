@@ -101,24 +101,23 @@ class CameraServiceProvider {
         val prev = localPreviewRenderer
         localPreviewRenderer = renderer
 
-        // 1) Detach from the previous renderer (avoid duplicate sinks/leaks)
-        localVideoTrack?.let { track ->
+        val track = localVideoTrack
+        val h = android.os.Handler(android.os.Looper.getMainLooper())
+
+        if (track != null) {
             if (prev != null && prev !== renderer) {
-                runCatching { track.removeSink(prev) }
+                h.post { runCatching { track.removeSink(prev) }.onFailure { /* ignore */ } }
             }
-        }
-
-        // 2) Attach to the new renderer if present
-        localVideoTrack?.let { track ->
             if (renderer != null) {
-                runCatching { track.addSink(renderer) }
+                h.post { runCatching { track.addSink(renderer) }.onFailure { /* ignore */ } }
             }
         }
 
-        // 3) Tell the WebRTC client so if the local track is (re)created later,
-        //    it will auto-bind the preview sink.
+        // Ensure future tracks auto-bind on the UI thread too
         runCatching { webRTCClient?.setLocalPreviewSink(renderer) }
     }
+
+
 
 
     private fun createRtcClient(appContext: Context): WebRTCClient {
@@ -157,8 +156,14 @@ class CameraServiceProvider {
                 Log.d(TAG_RTC, "Local video track created — attaching preview sink")
                 track.setEnabled(true)
                 localVideoTrack = track
-                localPreviewRenderer?.let { renderer -> runCatching { track.addSink(renderer) } }
+
+                localPreviewRenderer?.let { renderer ->
+                    val h = android.os.Handler(android.os.Looper.getMainLooper())
+                    h.post { runCatching { track.addSink(renderer) }.onFailure { /* ignore */ } }
+                }
             }
+
+
         })
 
         client.initialize(answerMode = (role == StreamRole.HELPER))

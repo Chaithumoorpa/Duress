@@ -294,10 +294,14 @@ class WebRTCClient(
 
     fun setLocalPreviewSink(sink: VideoSink?) {
         localPreviewSink = sink
-        if (sink != null && localVideoTrack != null) {
-            try { localVideoTrack?.addSink(sink) } catch (_: Throwable) {}
+        val t = localVideoTrack ?: return
+        if (sink != null) {
+            val h = android.os.Handler(android.os.Looper.getMainLooper())
+            h.post { runCatching { t.addSink(sink) }.onFailure { /* ignore */ } }
         }
     }
+
+
 
     fun release() {
         stopLocalVideo()

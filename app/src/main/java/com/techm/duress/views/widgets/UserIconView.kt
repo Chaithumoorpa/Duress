@@ -1,6 +1,12 @@
 package com.techm.duress.views.widgets
 
 import android.graphics.Typeface
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.*
@@ -19,22 +25,33 @@ fun UserIconView(
     giveHelpBtnPressed: Boolean,
     viewModel: MainViewModel
 ) {
-    // currentBeacon is a Compose State<String> like "IN_RECEPTION" / "Unknown"
+    //  Use the *value* of the name, not toString() on the Flow
+    val myName by viewModel.userName.collectAsState()
+
+    // Current beacon key ("IN_RECEPTION" / "Unknown" …)
     val currentBeaconKey by ZoneDetector.currentBeacon
 
-    // Remember current position; keep last known if beacon doesn’t map
-    var position by remember { mutableStateOf(Offset.Zero) }
+    // Keep last known position so we don't jump to (0,0) between updates
+    var position by remember { mutableStateOf<Offset?>(null) }
 
-    // Resolve position when beacon key changes
+    // Resolve position whenever beacon changes
     LaunchedEffect(currentBeaconKey) {
-        val pos = ZoneProvider.zonePositions[currentBeaconKey]
-        if (pos != null) {
-            position = pos
-        }
-        // If null, keep previous position (avoids snapping to 0,0)
+        ZoneProvider.zonePositions[currentBeaconKey]?.let { position = it }
     }
 
-    // Reuse a single Paint for the label
+    // Nice little blink (flicker). Faster if duress; slower otherwise.
+    val blinkSpecMs = if (isDuressDetected) 550 else 900
+    val blink by rememberInfiniteTransition(label = "blink").animateFloat(
+        initialValue = 0.35f,
+        targetValue = 1.0f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(blinkSpecMs, easing = LinearEasing),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "alpha"
+    )
+
+    // Single reusable Paint for label
     val textPaint = remember {
         android.graphics.Paint().apply {
             color = android.graphics.Color.BLACK
@@ -46,19 +63,23 @@ fun UserIconView(
     }
 
     Canvas(modifier = Modifier.fillMaxSize()) {
-        val dotColor = if (isDuressDetected && !giveHelpBtnPressed) Color.Red else Color.Blue
+        val center = position ?: return@Canvas
+
+        val dotColor =
+            if (isDuressDetected && !giveHelpBtnPressed) Color.Red else Color.Blue
 
         drawCircle(
             color = dotColor,
             radius = 6.dp.toPx(),
-            center = position
+            center = center,
+            alpha = blink //  flicker
         )
 
-        // Draw the user's name under the dot
+        // Label (real user name)
         drawContext.canvas.nativeCanvas.drawText(
-            viewModel.userName.toString(),
-            position.x,
-            position.y + 15.dp.toPx(),
+            if (myName.isNotBlank()) myName else "Me",
+            center.x,
+            center.y + 15.dp.toPx(),
             textPaint
         )
     }

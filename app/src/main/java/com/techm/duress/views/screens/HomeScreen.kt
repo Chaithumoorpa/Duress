@@ -12,6 +12,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import com.techm.duress.core.ble.BleProvider
@@ -68,6 +69,13 @@ fun HomeScreen(
 
 //    val role by viewModel.role.collectAsState()
     val isVictim = role == CameraServiceProvider.StreamRole.VICTIM
+    val showDistance = if (isVictim) {
+        // Victim should see meter once a helper is assigned
+        !helperName.isNullOrEmpty()
+    } else {
+        // Helper should see meter after they pressed “Give Help”
+        giveHelpBtnPressed
+    }
 
 
     // ---------- BLE zone “sim” ----------
@@ -298,15 +306,24 @@ fun HomeScreen(
                 MapView(context)
                 ZoneView(isDuressDetected = isDuressDetected.value, context = context)
                 UserIconView(isDuressDetected.value, giveHelpBtnPressed, viewModel)
-                if (isDuressDetected.value) {
-                    NearbyUsersIconView(isDuressDetected.value, context)
+                // Counterparty marker:
+                // Victim: show helper once known
+                val helper = helperName
+                if (!helper.isNullOrBlank()) {
+                    CounterpartyIconView(counterpartyName = helper, context = context)
+                }
+
+                // Helper: before/after giving help, show the victim (requesting user)
+                val victim = viewModel.requestingUser?.name
+                if (!victim.isNullOrBlank()) {
+                    CounterpartyIconView(counterpartyName = victim, context = context, color = Color(0xFFB22222)) // firebrick for victim
                 }
             }
 
             // ---------------------- Distance Meter ------------------------------
             ReusableBoxWithHeader(height = 100.dp, title = "Real Time Distance Meter") {
-                if (giveHelpBtnPressed && !helperName.isNullOrEmpty()) {
-                    DistanceMeter(context2)
+                if (showDistance) {
+                    DistanceMeter() // (see next section: no need to pass context)
                 } else {
                     Box {}
                 }

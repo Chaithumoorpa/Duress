@@ -1,7 +1,6 @@
 package com.techm.duress.views.widgets
 
 import android.Manifest
-import android.content.Context
 import android.content.pm.PackageManager
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -19,6 +18,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import com.techm.duress.core.location.fetchFriendLocationAndUpdateDistance
@@ -26,11 +26,13 @@ import com.techm.duress.core.location.startLocationUpdates
 import com.techm.duress.core.location.stopLocationUpdates
 
 @Composable
-fun DistanceMeter(context: Context) {
+fun DistanceMeter() {
+    val context = LocalContext.current
+
     var distance by remember { mutableStateOf(0f) }
     var locationPermissionGranted by remember { mutableStateOf(false) }
 
-    // Request either FINE or COARSE; accept whichever the user grants
+    // Request either FINE or COARSE (accept whichever is granted)
     val permissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { result ->
@@ -42,47 +44,41 @@ fun DistanceMeter(context: Context) {
         }
     }
 
-    // Request permissions once on first composition
+    // One-time permission request
     LaunchedEffect(Unit) {
-        permissionLauncher.launch(
-            arrayOf(
-                Manifest.permission.ACCESS_FINE_LOCATION,
-                Manifest.permission.ACCESS_COARSE_LOCATION
+        val alreadyGranted =
+            ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED ||
+                    ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
+        if (alreadyGranted) {
+            locationPermissionGranted = true
+        } else {
+            permissionLauncher.launch(
+                arrayOf(
+                    Manifest.permission.ACCESS_FINE_LOCATION,
+                    Manifest.permission.ACCESS_COARSE_LOCATION
+                )
             )
-        )
+        }
     }
 
-    // Keep latest setter without restarting effects
+    // Keep latest setter for callbacks
     val distanceSetter by rememberUpdatedState { v: Float -> distance = v }
 
-    // Helper: explicit permission check for lint + safety
-    fun hasLocationPermission(ctx: Context): Boolean {
-        val fine = ContextCompat.checkSelfPermission(
-            ctx, Manifest.permission.ACCESS_FINE_LOCATION
-        ) == PackageManager.PERMISSION_GRANTED
-        val coarse = ContextCompat.checkSelfPermission(
-            ctx, Manifest.permission.ACCESS_COARSE_LOCATION
-        ) == PackageManager.PERMISSION_GRANTED
-        return fine || coarse
-    }
-
-    // Start/stop updates tied to lifecycle, with explicit checks + try/catch
+    // Start updates only when permission is granted; stop on dispose
     DisposableEffect(locationPermissionGranted) {
-        val canStart = locationPermissionGranted && hasLocationPermission(context)
-        if (canStart) {
+        if (locationPermissionGranted) {
             try {
                 startLocationUpdates(context) { myLocation ->
                     fetchFriendLocationAndUpdateDistance(myLocation) { newDistance ->
                         distanceSetter(newDistance)
                     }
                 }
-            } catch (se: SecurityException) {
-                // In case perms were revoked between grant and call
+            } catch (_: SecurityException) {
                 Toast.makeText(context, "Location permission missing", Toast.LENGTH_SHORT).show()
             }
         }
         onDispose {
-            if (canStart) {
+            if (locationPermissionGranted) {
                 try { stopLocationUpdates(context) } catch (_: SecurityException) {}
             }
         }
@@ -94,11 +90,12 @@ fun DistanceMeter(context: Context) {
 }
 
 @Composable
-fun DistanceM(currentDistance: Float) {
+private fun DistanceM(currentDistance: Float) {
     var previousDistance by remember { mutableStateOf(currentDistance) }
     var gettingCloser by remember { mutableStateOf(false) }
 
     LaunchedEffect(currentDistance) {
+        // Simple trend indicator; you can replace with EMA/Kalman later
         gettingCloser = currentDistance < previousDistance
         previousDistance = currentDistance
     }
@@ -107,7 +104,7 @@ fun DistanceM(currentDistance: Float) {
 }
 
 @Composable
-fun DistanceMeterSection(distanceInMeters: Float, gettingCloser: Boolean) {
+private fun DistanceMeterSection(distanceInMeters: Float, gettingCloser: Boolean) {
     val maxSpacing = 100.dp
     val clamped = distanceInMeters.coerceIn(0f, 100f)
     val target = (clamped / 100f) * maxSpacing.value
@@ -130,9 +127,9 @@ fun DistanceMeterSection(distanceInMeters: Float, gettingCloser: Boolean) {
             verticalAlignment = Alignment.CenterVertically
         ) {
             Icon(Icons.Default.Person, contentDescription = "You")
-            Spacer(modifier = Modifier.width(animatedSpacing))
+            Spacer(Modifier.width(animatedSpacing))
             Icon(Icons.Default.ArrowForward, contentDescription = "Direction")
-            Spacer(modifier = Modifier.width(animatedSpacing))
+            Spacer(Modifier.width(animatedSpacing))
             Icon(Icons.Default.Person, contentDescription = "Friend")
         }
         Text("Distance: %.2f meters".format(distanceInMeters))
