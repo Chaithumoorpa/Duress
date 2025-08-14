@@ -55,8 +55,9 @@ dependencies {
     implementation("com.google.android.gms:play-services-location:21.0.1")
 
     // https://mvnrepository.com/artifact/io.github.webrtc-sdk/android
-    implementation("io.github.webrtc-sdk:android:114.5735.02")
+//    implementation("io.github.webrtc-sdk:android:114.5735.02")
     //implementation("com.infobip:google-webrtc:1.0.45036")
+    implementation("io.github.webrtc-sdk:android:125.6422.06.1")
 
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)

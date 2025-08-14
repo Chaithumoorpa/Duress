@@ -92,15 +92,27 @@ class WebRTCClient(
                         }
                     }
 
-                    override fun onAddTrack(receiver: RtpReceiver?, mediaStreams: Array<out MediaStream>?) {
+                    override fun onAddTrack(
+                        receiver: RtpReceiver?,
+                        mediaStreams: Array<out MediaStream>?
+                    ) {
+                        // Some devices still fire this — keep it as a fallback.
                         (receiver?.track() as? VideoTrack)?.let {
-                            Log.d(TAG, "Remote VideoTrack received")
+                            Log.d(TAG, "Remote VideoTrack received via onAddTrack()")
                             it.setEnabled(true)
                             signalingCallback.onRemoteVideoTrackReceived(it)
                         }
                     }
 
-                    override fun onTrack(transceiver: RtpTransceiver?) {}
+                    override fun onTrack(transceiver: RtpTransceiver?) {
+                        // Unified Plan prefers onTrack()
+                        val track = transceiver?.receiver?.track()
+                        if (track is VideoTrack) {
+                            Log.d(TAG, "Remote VideoTrack received via onTrack()")
+                            track.setEnabled(true)
+                            signalingCallback.onRemoteVideoTrackReceived(track)
+                        }
+                    }
                     override fun onConnectionChange(state: PeerConnection.PeerConnectionState?) {
                         Log.d(TAG, "PeerConnectionState=$state")
                     }

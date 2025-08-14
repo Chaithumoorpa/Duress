@@ -18,6 +18,10 @@ import org.webrtc.EglBase
 import org.webrtc.RendererCommon
 import org.webrtc.SurfaceViewRenderer
 
+/**
+ * Local camera preview for the Victim.
+ * The renderer is attached to WebRTC local track via viewModel.attachLocalRenderer(renderer).
+ */
 @Composable
 fun CameraView(
     viewModel: MainViewModel,
@@ -27,6 +31,7 @@ fun CameraView(
     val streamingState by viewModel.streamingState.collectAsState()
     val isHelpSessionActive by viewModel.isHelpSessionActive.collectAsState()
 
+    // Keep one EGL base across recompositions
     val eglBase = remember { EglBase.create() }
     var rendererRef by remember { mutableStateOf<SurfaceViewRenderer?>(null) }
 
@@ -40,17 +45,28 @@ fun CameraView(
                         ViewGroup.LayoutParams.MATCH_PARENT
                     )
                     init(eglBase.eglBaseContext, null)
+                    // Mirror for front-facing preview
                     setMirror(true)
                     setEnableHardwareScaler(true)
                     setScalingType(RendererCommon.ScalingType.SCALE_ASPECT_FILL)
+                    // Optional: ensure it sits under the remote if overlapping is used
+                    setZOrderMediaOverlay(false)
 
                     rendererRef = this
-                    viewModel.attachLocalRenderer(this) // attach preview sink
+                    // Attach the local preview sink
+                    viewModel.attachLocalRenderer(this)
                 }
             },
-            update = { /* No-op — frames come from WebRTC */ }
+            update = {
+                // If renderer was recreated, reattach
+                if (rendererRef !== it) {
+                    rendererRef = it
+                    viewModel.attachLocalRenderer(it)
+                }
+            }
         )
 
+        // Clean up when composable leaves the screen
         DisposableEffect(Unit) {
             onDispose {
                 try { viewModel.attachLocalRenderer(null) } catch (_: Throwable) {}

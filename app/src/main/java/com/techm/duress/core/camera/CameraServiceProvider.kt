@@ -96,13 +96,30 @@ class CameraServiceProvider {
     fun isStreamActive(): Boolean =
         started.get() && signalingSocket != null && webRTCClient != null
 
+    @MainThread
     fun setLocalPreviewSink(renderer: SurfaceViewRenderer?) {
+        val prev = localPreviewRenderer
         localPreviewRenderer = renderer
-        runCatching { webRTCClient?.setLocalPreviewSink(renderer) }
+
+        // 1) Detach from the previous renderer (avoid duplicate sinks/leaks)
         localVideoTrack?.let { track ->
-            runCatching { renderer?.let { track.addSink(it) } }
+            if (prev != null && prev !== renderer) {
+                runCatching { track.removeSink(prev) }
+            }
         }
+
+        // 2) Attach to the new renderer if present
+        localVideoTrack?.let { track ->
+            if (renderer != null) {
+                runCatching { track.addSink(renderer) }
+            }
+        }
+
+        // 3) Tell the WebRTC client so if the local track is (re)created later,
+        //    it will auto-bind the preview sink.
+        runCatching { webRTCClient?.setLocalPreviewSink(renderer) }
     }
+
 
     private fun createRtcClient(appContext: Context): WebRTCClient {
         val t0 = SystemClock.elapsedRealtime()
