@@ -118,6 +118,11 @@ class CameraServiceProvider {
     }
 
 
+    // CameraServiceProvider.kt  (add)
+    @MainThread
+    fun flipCamera() {
+        runCatching { webRTCClient?.switchCamera() }
+    }
 
 
     private fun createRtcClient(appContext: Context): WebRTCClient {

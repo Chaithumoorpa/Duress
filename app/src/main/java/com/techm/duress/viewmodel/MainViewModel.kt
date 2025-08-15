@@ -450,6 +450,11 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    // MainViewModel.kt  (add)
+    fun flipCamera() {
+        try { cameraProvider.flipCamera() } catch (_: Throwable) {}
+    }
+
 
     // ---------------- Helpers ---------------------------------
     private fun teardownSessionState() {

@@ -53,6 +53,8 @@ dependencies {
     implementation("androidx.media3:media3-exoplayer-hls:1.2.0")
 
     implementation("com.google.android.gms:play-services-location:21.0.1")
+    implementation("androidx.compose.material:material-icons-extended:1.7.8")
+
 
     // https://mvnrepository.com/artifact/io.github.webrtc-sdk/android
 //    implementation("io.github.webrtc-sdk:android:114.5735.02")

@@ -38,6 +38,8 @@ class WebRTCClient(
     private var answerMode = false
 
     private var videoTransceiver: RtpTransceiver? = null
+    private var isFrontFacing = true
+
 
     init {
         val initOptions = PeerConnectionFactory.InitializationOptions
@@ -360,16 +362,44 @@ class WebRTCClient(
         peerConnectionFactory.dispose()
     }
 
+
     private fun createCameraCapturer(): VideoCapturer {
         val enumerator = Camera2Enumerator(context)
-        enumerator.deviceNames.firstOrNull { enumerator.isFrontFacing(it) }?.let {
-            return enumerator.createCapturer(it, null) ?: throw IllegalStateException("No camera")
+
+        // Prefer front, fall back to back
+        enumerator.deviceNames.firstOrNull { enumerator.isFrontFacing(it) }?.let { name ->
+            isFrontFacing = true
+            return enumerator.createCapturer(name, null)
+                ?: throw IllegalStateException("No front camera capturer")
         }
-        enumerator.deviceNames.firstOrNull { enumerator.isBackFacing(it) }?.let {
-            return enumerator.createCapturer(it, null) ?: throw IllegalStateException("No camera")
+        enumerator.deviceNames.firstOrNull { enumerator.isBackFacing(it) }?.let { name ->
+            isFrontFacing = false
+            return enumerator.createCapturer(name, null)
+                ?: throw IllegalStateException("No back camera capturer")
         }
         throw IllegalStateException("No usable camera device found.")
     }
+
+    fun switchCamera(onDone: ((Boolean) -> Unit)? = null) {
+        val cam = videoCapturer as? CameraVideoCapturer ?: return
+        try {
+            cam.switchCamera(object : CameraVideoCapturer.CameraSwitchHandler {
+                override fun onCameraSwitchDone(isFrontCamera: Boolean) {
+                    isFrontFacing = isFrontCamera
+                    Log.d(TAG, "Camera switched. Front=$isFrontFacing")
+                    onDone?.invoke(isFrontFacing)
+                }
+                override fun onCameraSwitchError(errorDescription: String?) {
+                    Log.w(TAG, "Camera switch error: $errorDescription")
+                    onDone?.invoke(isFrontFacing) // unchanged
+                }
+            })
+        } catch (t: Throwable) {
+            Log.w(TAG, "Camera switch threw: ${t.message}")
+            onDone?.invoke(isFrontFacing)
+        }
+    }
+
 
     fun startInboundStatsDebug(tag: String = "DU/STATS") {
         val pc = peerConnection ?: return
@@ -419,7 +449,5 @@ class WebRTCClient(
         }
         return lines.joinToString("\r\n")
     }
-
-
 
 }
