@@ -32,7 +32,7 @@ enum class StreamingState { Idle, Signaling, Streaming }
 class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     // --- Config ---------------------------------------------------------------
-    var baseUrl: String = "http://10.136.125.42:8080/duress" // TODO: inject/env for prod
+    var baseUrl: String = "http://192.168.0.101:8080/duress" // TODO: inject/env for prod
 
     // --- User/session model ---------------------------------------------------
     private val _userName = MutableStateFlow("")

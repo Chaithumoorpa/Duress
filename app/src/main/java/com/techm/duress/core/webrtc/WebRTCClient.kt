@@ -46,10 +46,17 @@ class WebRTCClient(
             .createInitializationOptions()
         PeerConnectionFactory.initialize(initOptions)
 
+        // BEFORE
+        // val encoderFactory = DefaultVideoEncoderFactory(eglBase.eglBaseContext, true, true)
+        // val decoderFactory = DefaultVideoDecoderFactory(eglBase.eglBaseContext)
+
         val encoderFactory = DefaultVideoEncoderFactory(
-            eglBase.eglBaseContext, true, true
+            eglBase.eglBaseContext,
+            /* enableIntelVp8Encoder = */ true,
+            /* enableH264HighProfile = */ false   // don't push H.264 high profile
         )
-        val decoderFactory = DefaultVideoDecoderFactory(eglBase.eglBaseContext)
+        val decoderFactory = SoftwareVideoDecoderFactory()  // emulator-safe VP8 decode
+
 
         peerConnectionFactory = PeerConnectionFactory.builder()
             .setVideoEncoderFactory(encoderFactory)
@@ -62,7 +69,20 @@ class WebRTCClient(
 
         CoroutineScope(Dispatchers.Default).launch {
             val iceServers = listOf(
-                PeerConnection.IceServer.builder("stun:stun.l.google.com:19302").createIceServer()
+//                PeerConnection.IceServer.builder("stun:stun.l.google.com:19302").createIceServer()
+                PeerConnection.IceServer.builder("stun:192.168.0.101:3478").createIceServer(),
+
+                // TURN over UDP
+                PeerConnection.IceServer.builder("turn:192.168.0.101:3478")
+                    .setUsername("akhil")
+                    .setPassword("sharma")
+                    .createIceServer(),
+
+                // TURN over TCP (helps with strict Wi-Fi/NATs)
+                PeerConnection.IceServer.builder("turn:192.168.0.101:3478?transport=tcp")
+                    .setUsername("akhil")
+                    .setPassword("sharma")
+                    .createIceServer()
             )
 
             val rtcConfig = PeerConnection.RTCConfiguration(iceServers).apply {
@@ -133,10 +153,17 @@ class WebRTCClient(
             else
                 RtpTransceiver.RtpTransceiverDirection.RECV_ONLY
 
-            videoTransceiver = peerConnection?.addTransceiver(
-                MediaStreamTrack.MediaType.MEDIA_TYPE_VIDEO,
-                RtpTransceiver.RtpTransceiverInit(videoDir)
-            )
+            // Put VP8 first so offers/answers naturally negotiate VP8
+            try {
+                val caps = peerConnectionFactory.getRtpSenderCapabilities(
+                    MediaStreamTrack.MediaType.MEDIA_TYPE_VIDEO
+                )
+                val vp8First = caps.codecs.sortedBy { if (it.mimeType.equals("video/VP8", true)) 0 else 1 }
+                videoTransceiver?.setCodecPreferences(vp8First)
+            } catch (_: Throwable) {
+                // Older builds may not support codec preferences — SDP munging will cover it.
+            }
+
 
             val audioDir = if (!answerMode)
                 RtpTransceiver.RtpTransceiverDirection.SEND_ONLY
@@ -168,7 +195,8 @@ class WebRTCClient(
 
         videoCapturer = createCameraCapturer()
         videoCapturer?.initialize(surfaceTextureHelper, context, localVideoSource?.capturerObserver)
-        videoCapturer?.startCapture(640, 360, 15)
+        videoCapturer?.startCapture(1280, 720, 30)
+        localVideoSource?.adaptOutputFormat(1280, 720, 30)
 
         localVideoTrack = peerConnectionFactory.createVideoTrack("video_track", localVideoSource)
         localVideoTrack?.setEnabled(true)
@@ -229,26 +257,39 @@ class WebRTCClient(
     private fun createOffer() {
         if (answerMode) return
         val pc = peerConnection ?: return
+
         CoroutineScope(Dispatchers.Default).launch {
             pc.createOffer(object : SdpObserver {
                 override fun onCreateSuccess(sdp: SessionDescription?) {
                     if (sdp == null) { Log.e(TAG, "createOffer returned null"); return }
+
+                    // --- PATCH: prefer VP8 in the local SDP we set/send ---
+                    val vp8Sdp  = preferVideoCodec(sdp.description, "VP8")
+                    val patched = SessionDescription(sdp.type, vp8Sdp)
+
                     pc.setLocalDescription(object : SdpObserver {
                         override fun onSetSuccess() {
-                            Log.d(TAG, "Local OFFER set → send to server")
-                            signalingCallback.onLocalSDPGenerated(sdp)
+                            Log.d(TAG, "Local OFFER set (VP8 preferred) → send to server")
+                            // Send the patched SDP (not the original)
+                            signalingCallback.onLocalSDPGenerated(patched)
                         }
-                        override fun onSetFailure(error: String?) { Log.e(TAG, "setLocal(offer) failed: $error") }
+                        override fun onSetFailure(error: String?) {
+                            Log.e(TAG, "setLocal(offer) failed: $error")
+                        }
                         override fun onCreateSuccess(p0: SessionDescription?) {}
                         override fun onCreateFailure(p0: String?) {}
-                    }, sdp)
+                    }, patched)
                 }
-                override fun onCreateFailure(error: String?) { Log.e(TAG, "createOffer failed: $error") }
+
+                override fun onCreateFailure(error: String?) {
+                    Log.e(TAG, "createOffer failed: $error")
+                }
                 override fun onSetSuccess() {}
                 override fun onSetFailure(error: String?) {}
             }, MediaConstraints())
         }
     }
+
 
     fun createAnswer() {
         val pc = peerConnection ?: return
@@ -256,16 +297,20 @@ class WebRTCClient(
             pc.createAnswer(object : SdpObserver {
                 override fun onCreateSuccess(sdp: SessionDescription?) {
                     if (sdp == null) { Log.e(TAG, "createAnswer returned null"); return }
+
+                    val vp8Sdp  = preferVideoCodec(sdp.description, "VP8")
+                    val patched = SessionDescription(sdp.type, vp8Sdp)
+
                     pc.setLocalDescription(object : SdpObserver {
                         override fun onSetSuccess() {
-                            Log.d(TAG, "Local ANSWER set → send to server")
+                            Log.d(TAG, "Local ANSWER set (VP8 preferred) → send to server")
                             flushPendingCandidates()
-                            signalingCallback.onLocalSDPGenerated(sdp)
+                            signalingCallback.onLocalSDPGenerated(patched)
                         }
                         override fun onSetFailure(error: String?) { Log.e(TAG, "setLocal(answer) failed: $error") }
                         override fun onCreateSuccess(p0: SessionDescription?) {}
                         override fun onCreateFailure(p0: String?) {}
-                    }, sdp)
+                    }, patched)
                 }
                 override fun onCreateFailure(error: String?) { Log.e(TAG, "createAnswer failed: $error") }
                 override fun onSetSuccess() {}
@@ -349,6 +394,32 @@ class WebRTCClient(
             }
         }
     }
+
+    private fun preferVideoCodec(sdp: String, codec: String): String {
+        // Move desired codec to front of m=video line's payload list
+        val lines = sdp.split("\r\n").toMutableList()
+        val mLineIndex = lines.indexOfFirst { it.startsWith("m=video") }
+        if (mLineIndex == -1) return sdp
+
+        // Find payload type for the codec (from a=rtpmap)
+        val ptRegex = Regex("""a=rtpmap:(\d+)\s+$codec/""", RegexOption.IGNORE_CASE)
+        val pts = lines.mapNotNull { ln ->
+            ptRegex.find(ln)?.groupValues?.getOrNull(1)
+        }
+        if (pts.isEmpty()) return sdp
+
+        val m = lines[mLineIndex].split(" ").toMutableList()
+        if (m.size > 3) {
+            // m=video <port> <proto> <pt list...>
+            val header = m.subList(0, 3)
+            val rest = m.subList(3, m.size).toMutableList()
+            // move our payload types to the front, keep order otherwise
+            val reordered = pts + rest.filterNot { it in pts }
+            lines[mLineIndex] = (header + reordered).joinToString(" ")
+        }
+        return lines.joinToString("\r\n")
+    }
+
 
 
 }
